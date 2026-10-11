@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Android: flexible in-app updates — builds installed from Google Play prompt for a new version on launch, download it in the background and offer a restart.
+- Android: mandatory in-app updates — a build installed from Google Play checks for a newer version whenever it is idle (never during a stream or the demo) and, if there is one, Play's full-screen update installs it and restarts the app; backing out closes the app.
 
 ### Changed
 - Android: release builds are now shrunk and obfuscated with R8 (Play's DEX-optimization requirement; also cuts the install size). Crash traces stay readable via the mapping embedded in the bundle.

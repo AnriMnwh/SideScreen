@@ -117,7 +117,7 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
-        appUpdater = AppUpdater(this) { binding.root }
+        appUpdater = AppUpdater(this)
 
         // Apply fullscreen mode immediately
         enableFullscreenMode()
@@ -1769,7 +1769,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        appUpdater.release()
         stopChecklistUpdates()
         cleanup()
     }
