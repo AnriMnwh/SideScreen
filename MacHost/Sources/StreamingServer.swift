@@ -29,6 +29,11 @@ private enum WireMessage {
     /// only. Sent ONLY to clients that sent clientSupportsDesktopGeometry —
     /// older clients disconnect on unknown message types.
     static let desktopGeometry: UInt8 = 13
+    /// Client→server, 12-byte payload: the client's sustainable decode size
+    /// at each CodecLimits.tableFps rate (three 4-byte sizes in the type-11
+    /// encoding, every byte high-bit set). Sent after type 11, which older
+    /// hosts still read; hosts that know this type prefer it (issue #78).
+    static let clientDecoderLimitTable: UInt8 = 14
 }
 
 private extension NWEndpoint {
@@ -225,6 +230,8 @@ class StreamingServer {
     private var clientIsAvcOnly = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    /// Sustainable decode size per frame rate (type 14), keyed by fps.
+    private(set) var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
     /// Set when the client opts in via type 12. Gates desktopGeometry sends.
     private var clientSupportsDesktopGeometry = false
     /// Logical desktop size, reported alongside the encoded size for display.
@@ -334,6 +341,7 @@ class StreamingServer {
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
         clientDecodeLimits = nil
+        clientDecodeLimitTable = nil
         clientSupportsDesktopGeometry = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -755,6 +763,47 @@ class StreamingServer {
                         if (displayWidth, displayHeight) != before {
                             sendDisplaySize()
                         }
+                    }
+                }
+
+            case WireMessage.clientDecoderLimitTable:
+                // Type + 12 payload bytes: one (w, h) pair per
+                // CodecLimits.tableFps entry, in order, each in the type-11
+                // encoding. Sent BEFORE type 8, like type 11.
+                let payloadCount = 4 * CodecLimits.tableFps.count
+                guard inputBuffer.count >= 1 + payloadCount else { return }
+
+                let payload = (1...payloadCount).map { inputByte(at: $0) }
+                consumeInputBytes(1 + payloadCount)
+                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
+                    debugLog("Malformed decoder-limit-table payload — ignoring")
+                    continue
+                }
+                var table: [Int: (width: Int, height: Int)] = [:]
+                for (i, fps) in CodecLimits.tableFps.enumerated() {
+                    let w = (Int(payload[4 * i] & 0x7F) << 7) | Int(payload[4 * i + 1] & 0x7F)
+                    let h = (Int(payload[4 * i + 2] & 0x7F) << 7) | Int(payload[4 * i + 3] & 0x7F)
+                    // Anything below QVGA-ish is a nonsense report — drop the whole table.
+                    guard w >= 256, h >= 256 else {
+                        table.removeAll()
+                        break
+                    }
+                    table[fps] = (w, h)
+                }
+                guard !table.isEmpty else {
+                    debugLog("Decoder limit table has a nonsense entry — ignoring")
+                    continue
+                }
+                clientDecodeLimitTable = table
+                let desc = CodecLimits.tableFps.compactMap { fps in table[fps].map { "\(fps)fps=\($0.width)x\($0.height)" } }
+                debugLog("Client decoder limit table: \(desc.joined(separator: ", "))")
+                if connectionReady {
+                    // Same late-arrival handling as type 11.
+                    debugLog("Decoder limit table arrived late — re-negotiating")
+                    let before = (displayWidth, displayHeight)
+                    onCodecNegotiated?(clientIsAvcOnly ? .h264 : .hevc)
+                    if (displayWidth, displayHeight) != before {
+                        sendDisplaySize()
                     }
                 }
 

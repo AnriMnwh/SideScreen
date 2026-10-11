@@ -1162,7 +1162,7 @@ class MainActivity : AppCompatActivity() {
                             this,
                             "No video output — the stream resolution may exceed " +
                                 "this tablet's decoder limit$capText. " +
-                                "Lower the resolution or disable HiDPI on the Mac.",
+                                "Lower the resolution or refresh rate, or disable HiDPI, on the Mac.",
                             android.widget.Toast.LENGTH_LONG,
                         ).show()
                 }

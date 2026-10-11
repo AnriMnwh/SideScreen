@@ -664,7 +664,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // dimensions for the negotiated codec.
             streamingServer?.onCodecNegotiated = { [weak self] codec in
                 guard let self = self, let capture = self.screenCapture else { return }
-                capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
+                capture.negotiate(
+                    codec: codec,
+                    clientLimit: self.streamingServer?.clientDecodeLimits,
+                    clientLimitTable: self.streamingServer?.clientDecodeLimitTable
+                )
                 let enc = capture.encodeSize(for: codec)
                 // Whatever the codec negotiation settled on, this is what the
                 // stream's SPS will carry, so it is what the client must size

@@ -1,6 +1,7 @@
 package com.sidescreen.app
 
 import android.content.Context
+import android.media.MediaFormat
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Process
@@ -129,6 +130,7 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
@@ -353,6 +355,7 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseDesktopGeometrySupport() // Likewise
@@ -395,18 +398,34 @@ class StreamClient(
         }
     }
 
+    /** Panel and codec the current connection advertises; fixed once per connect so every message agrees. */
+    private var panel: PanelGeometry? = null
+    private var negotiationMime: String = MediaFormat.MIMETYPE_VIDEO_HEVC
+
+    private fun prepareAdvertisements() {
+        panel = PanelGeometry.ofDefaultDisplay(context)
+        val fallback =
+            if (CodecCapabilities.hasHevcDecoder) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+        negotiationMime = panel?.let { CodecCapabilities.preferredStreamMime(it.width, it.height) } ?: fallback
+    }
+
     private fun advertiseAvcOnlyIfNeeded() {
-        if (CodecCapabilities.hasHevcDecoder) return
+        if (negotiationMime != MediaFormat.MIMETYPE_VIDEO_AVC) return
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_AVC_ONLY)
             out.flush()
-            diagLog("Advertised AVC-only (no HEVC decoder on this device)")
+            val why =
+                if (CodecCapabilities.hasHevcDecoder) {
+                    "H.264 sustains a larger picture than HEVC on this device"
+                } else {
+                    "no HEVC decoder on this device"
+                }
+            diagLog("Advertised AVC-only ($why)")
         }
     }
 
     private fun advertiseDecoderLimits() {
-        val mime = CodecCapabilities.streamMime
-        val panel = PanelGeometry.ofDefaultDisplay(context)
+        val mime = negotiationMime
         // Nominal limit only as a fallback: it ignores blocks-per-second, so on most devices it is
         // far too high to protect anything.
         val limit =
@@ -414,20 +433,36 @@ class StreamClient(
                 ?: CodecCapabilities.nominalMaxDecodeSize(mime)
                 ?: return
         val (maxW, maxH) = limit
-        val w = maxW.coerceAtMost(16383)
-        val h = maxH.coerceAtMost(16383)
-        if (w < 256 || h < 256) return
+        if (maxW < 256 || maxH < 256) return
         outputStream?.let { out ->
             out.writeByte(MESSAGE_CLIENT_DECODER_LIMITS)
-            // 7 data bits per byte with the high bit always set: an old Mac
-            // skips unknown types one byte at a time, so payload bytes must
-            // never collide with real message-type values.
-            out.writeByte(0x80 or ((w shr 7) and 0x7F))
-            out.writeByte(0x80 or (w and 0x7F))
-            out.writeByte(0x80 or ((h shr 7) and 0x7F))
-            out.writeByte(0x80 or (h and 0x7F))
+            out.write(DecoderLimitWire.encodeSize(maxW, maxH))
             out.flush()
-            diagLog("Advertised stream limit ${w}x$h for $mime (panel=$panel)")
+            val fps = CodecCapabilities.REFERENCE_FPS
+            diagLog("Advertised stream limit ${maxW}x$maxH at $fps fps for $mime (panel=$panel)")
+        }
+        advertiseDecoderLimitTable(mime)
+    }
+
+    /**
+     * Type 14: the sustainable size at each CodecCapabilities.TABLE_FPS rate, so the Mac can use
+     * the figure for the rate it actually streams at instead of scaling the 60 fps one (issue
+     * #78). Sent after type 11, which stays for Macs that predate this message and skip it.
+     */
+    private fun advertiseDecoderLimitTable(mime: String) {
+        val p = panel ?: return
+        val table = CodecCapabilities.streamLimitTable(mime, p.width, p.height) ?: return
+        if (table.any { (w, h) -> w < 256 || h < 256 }) return
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_DECODER_LIMIT_TABLE)
+            out.write(DecoderLimitWire.encodeTable(table))
+            out.flush()
+            val desc =
+                CodecCapabilities.TABLE_FPS.zip(table).joinToString {
+                        (fps, size) ->
+                    "${fps}fps=${size.first}x${size.second}"
+                }
+            diagLog("Advertised stream limit table $desc for $mime")
         }
     }
 
@@ -735,6 +770,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
         private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
         private const val MESSAGE_DESKTOP_GEOMETRY = 13
+        private const val MESSAGE_CLIENT_DECODER_LIMIT_TABLE = 14
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 
