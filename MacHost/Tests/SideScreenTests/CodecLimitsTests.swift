@@ -126,4 +126,66 @@ final class CodecLimitsTests: XCTestCase {
         XCTAssertEqual(aspectIn, aspectOut, accuracy: 0.05)
         XCTAssertLessThanOrEqual(r.width, 1920)
     }
+
+    // MARK: - Per-rate limit table (issue #78)
+
+    private let honorPadX9: [Int: (width: Int, height: Int)] = [
+        30: (width: 2000, height: 1200),
+        60: (width: 1744, height: 1040),
+        120: (width: 1248, height: 752),
+    ]
+
+    func testTableEntryAtTheStreamRateIsUsed() {
+        let r = CodecLimits.budget(limit: (width: 1744, height: 1040), table: honorPadX9, forFps: 30)
+        XCTAssertEqual(r?.width, 2000)
+        XCTAssertEqual(r?.height, 1200)
+    }
+
+    func testMeasuredEntryBeatsTheSingleLimit() {
+        let r = CodecLimits.budget(limit: (width: 1744, height: 1040), table: honorPadX9, forFps: 60)
+        XCTAssertEqual(r?.width, 1744)
+        XCTAssertEqual(r?.height, 1040)
+    }
+
+    func testRateBetweenEntriesRoundsUpToTheNextMeasuredRate() {
+        let r = CodecLimits.budget(limit: nil, table: honorPadX9, forFps: 90)
+        XCTAssertEqual(r?.width, 1248)
+        XCTAssertEqual(r?.height, 752)
+    }
+
+    func testRateAboveTheTableScalesItsFastestEntryByArea() {
+        let r = CodecLimits.budget(limit: nil, table: honorPadX9, forFps: 240)!
+        let areaRatio = Double(r.width * r.height) / Double(1248 * 752)
+        XCTAssertEqual(areaRatio, 0.5, accuracy: 0.05)
+        XCTAssertEqual(r.width % 16, 0)
+        XCTAssertEqual(r.height % 16, 0)
+    }
+
+    func testPanelSizedLimitIsNotScaledWhenTheTableSaysTheRateIsFine() {
+        // CryoLogicat's MatePad Air (#78): the 60 fps limit was the panel itself,
+        // and the old scaling halved its area at 120 Hz although the decoder had
+        // budget to spare. A measured 120 fps entry keeps the panel.
+        let panel = (width: 2800, height: 1840)
+        let table = [30: panel, 60: panel, 120: panel]
+        let r = CodecLimits.budget(limit: panel, table: table, forFps: 120)!
+        let enc = CodecLimits.clampToClientLimit(width: 2800, height: 1840, limit: r)
+        XCTAssertEqual(enc.width, 2800)
+        XCTAssertEqual(enc.height, 1840)
+    }
+
+    func testWithoutATableTheSingleLimitScalesAsBefore() {
+        // The exact figure reported in #78: 2800x1840 at 120 Hz became 1968x1280.
+        let panel = (width: 2800, height: 1840)
+        let r = CodecLimits.budget(limit: panel, table: nil, forFps: 120)!
+        XCTAssertEqual(r.width, 1968)
+        XCTAssertEqual(r.height, 1296)
+        let enc = CodecLimits.clampToClientLimit(width: 2800, height: 1840, limit: r)
+        XCTAssertEqual(enc.width, 1968)
+        XCTAssertEqual(enc.height, 1280)
+    }
+
+    func testNothingReportedGivesNoBudget() {
+        XCTAssertNil(CodecLimits.budget(limit: nil, table: nil, forFps: 60))
+        XCTAssertNil(CodecLimits.budget(limit: nil, table: [:], forFps: 60))
+    }
 }

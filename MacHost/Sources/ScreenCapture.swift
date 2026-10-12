@@ -140,6 +140,8 @@ class ScreenCapture {
     /// smaller of its panel size and what its decoder can sustain at the panel
     /// refresh rate. Nil for legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
+    /// The same ceiling measured per frame rate (type 14), when the client sent it.
+    private var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
 
     /// Encode dimensions for a codec: physical display pixels, clamped to the
     /// client's reported ceiling when known, else to the conservative AVC floor
@@ -153,8 +155,7 @@ class ScreenCapture {
         let phys = (displayWidth, displayHeight)
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
-        if let limit = clientDecodeLimit {
-            let budget = CodecLimits.scaleLimit(limit, forFps: refreshRate)
+        if let budget = CodecLimits.budget(limit: clientDecodeLimit, table: clientDecodeLimitTable, forFps: refreshRate) {
             return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
         }
         switch codec {
@@ -749,7 +750,11 @@ class ScreenCapture {
     /// client's reported decoder ceiling. Rebuilds the encoder mid-session
     /// when either changes the encode setup (a codec switch, or a ceiling
     /// that alters the encode dimensions — issue #41).
-    func negotiate(codec newCodec: StreamCodec, clientLimit: (width: Int, height: Int)?) {
+    func negotiate(
+        codec newCodec: StreamCodec,
+        clientLimit: (width: Int, height: Int)?,
+        clientLimitTable: [Int: (width: Int, height: Int)]? = nil
+    ) {
         let sizeBefore = encodeSize(for: codec)
         let codecChanged = newCodec != codec
         if codecChanged {
@@ -757,13 +762,15 @@ class ScreenCapture {
         }
         codec = newCodec
         clientDecodeLimit = clientLimit
+        clientDecodeLimitTable = clientLimitTable
 
         guard encoder != nil else { return }  // not streaming yet; startStreaming will pick both up
 
         let sizeAfter = encodeSize(for: newCodec)
         guard codecChanged || sizeBefore != sizeAfter else { return }
         if sizeBefore != sizeAfter {
-            let limitDesc = clientLimit.map { "\($0.width)x\($0.height)" } ?? "none"
+            let budget = CodecLimits.budget(limit: clientLimit, table: clientLimitTable, forFps: refreshRate)
+            let limitDesc = budget.map { "\($0.width)x\($0.height) at \(refreshRate) fps" } ?? "none"
             debugLog("Encode size \(sizeBefore.width)x\(sizeBefore.height) -> \(sizeAfter.width)x\(sizeAfter.height) (client decoder limit: \(limitDesc))")
         }
         rebuildEncoder()

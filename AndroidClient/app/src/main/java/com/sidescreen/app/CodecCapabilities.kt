@@ -60,9 +60,33 @@ object CodecCapabilities {
         }
     }
 
-    /** Mime the client will ask the Mac to stream: HEVC when usable, else AVC. */
-    val streamMime: String
-        get() = if (hasHevcDecoder) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
+    /**
+     * How much larger (by area) the H.264 picture must be before it is worth its higher bitrate.
+     * Below this the two codecs are treated as equivalent and HEVC keeps its bandwidth edge.
+     */
+    private const val AVC_PREFERENCE_AREA_GAIN = 1.2
+
+    /**
+     * Mime the client will ask the Mac to stream for a panel of [panelWidth]x[panelHeight]:
+     * HEVC unless the device has no usable HEVC decoder, or its H.264 decoder sustains a
+     * noticeably larger picture at [REFERENCE_FPS]. Budget tablets commonly pair a Level 4 HEVC
+     * decoder (about 1080p30) with a far higher H.264 one; streaming HEVC there means a blurry
+     * upscale of a quarter-size picture (issue #78). A non-positive panel size falls back to
+     * decoder availability alone.
+     */
+    fun preferredStreamMime(
+        panelWidth: Int,
+        panelHeight: Int,
+    ): String {
+        if (!hasHevcDecoder) return MediaFormat.MIMETYPE_VIDEO_AVC
+        val hevc = maxStreamSize(MediaFormat.MIMETYPE_VIDEO_HEVC, panelWidth, panelHeight, REFERENCE_FPS)
+        val avc = maxStreamSize(MediaFormat.MIMETYPE_VIDEO_AVC, panelWidth, panelHeight, REFERENCE_FPS)
+        if (hevc == null || avc == null) return MediaFormat.MIMETYPE_VIDEO_HEVC
+        val gain = area(avc) / area(hevc)
+        return if (gain >= AVC_PREFERENCE_AREA_GAIN) MediaFormat.MIMETYPE_VIDEO_AVC else MediaFormat.MIMETYPE_VIDEO_HEVC
+    }
+
+    private fun area(size: Pair<Int, Int>): Double = size.first.toDouble() * size.second.toDouble()
 
     private val nominalSizeCache = HashMap<String, Pair<Int, Int>?>()
 
@@ -84,8 +108,18 @@ object CodecCapabilities {
     private fun probeNominalSize(mime: String): Pair<Int, Int>? =
         bestVideoCapabilities(mime)?.let { it.supportedWidths.upper to it.supportedHeights.upper }
 
-    /** Video capabilities of the largest usable hardware decoder for [mime]. */
+    private val capsCache = HashMap<String, MediaCodecInfo.VideoCapabilities?>()
+
+    /**
+     * Video capabilities of the largest usable hardware decoder for [mime]. Cached: a connection
+     * now asks several times (per codec, per table rate) and MediaCodecList enumeration is slow.
+     */
     private fun bestVideoCapabilities(mime: String): MediaCodecInfo.VideoCapabilities? =
+        synchronized(capsCache) {
+            capsCache.getOrPut(mime.lowercase()) { enumerateBestVideoCapabilities(mime) }
+        }
+
+    private fun enumerateBestVideoCapabilities(mime: String): MediaCodecInfo.VideoCapabilities? =
         try {
             MediaCodecList(MediaCodecList.ALL_CODECS)
                 .codecInfos
@@ -112,6 +146,25 @@ object CodecCapabilities {
      * must agree on the number (see CodecLimits.scaleLimit on the Mac).
      */
     const val REFERENCE_FPS = 60
+
+    /**
+     * Frame rates the client measures [maxStreamSize] at for the type-14 limit table, in wire
+     * order. The Mac picks the entry at or above its own frame rate, so a 30 Hz stream gets the
+     * whole decode budget instead of the 60 Hz figure, and a 120 Hz stream gets a measured figure
+     * instead of a guess scaled from a limit that may only have been the panel size (issue #78).
+     * Must match CodecLimits.tableFps on the Mac.
+     */
+    val TABLE_FPS = intArrayOf(30, 60, 120)
+
+    /**
+     * [maxStreamSize] at every [TABLE_FPS] rate, in that order, or null when any rate cannot be
+     * measured (the Mac then falls back to the single [REFERENCE_FPS] limit).
+     */
+    fun streamLimitTable(
+        mime: String,
+        panelWidth: Int,
+        panelHeight: Int,
+    ): List<Pair<Int, Int>>? = TABLE_FPS.map { maxStreamSize(mime, panelWidth, panelHeight, it) ?: return null }
 
     /**
      * The largest frame the Mac should ever encode for us: no larger than the panel can show, and

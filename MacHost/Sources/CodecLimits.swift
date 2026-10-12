@@ -42,17 +42,48 @@ enum CodecLimits {
     /// CodecCapabilities.REFERENCE_FPS on Android).
     static let clientLimitReferenceFps = 60
 
+    /// Frame rates a type-14 client measures its sustainable size at, in wire
+    /// order (mirrors CodecCapabilities.TABLE_FPS on Android).
+    static let tableFps = [30, 60, 120]
+
     /// The client's limit is a blocks-per-second budget expressed as a frame
     /// size at `clientLimitReferenceFps`. Streaming faster than that spends the
     /// same budget on more frames, so shrink the box's area by
     /// reference/fps (each side by the square root), keeping its aspect.
     /// Slower streams do not grow it: the panel bound still applies.
-    static func scaleLimit(_ limit: (width: Int, height: Int), forFps fps: Int) -> (width: Int, height: Int) {
-        guard fps > clientLimitReferenceFps, limit.width > 0, limit.height > 0 else { return limit }
-        let k = (Double(clientLimitReferenceFps) / Double(fps)).squareRoot()
+    static func scaleLimit(
+        _ limit: (width: Int, height: Int),
+        forFps fps: Int,
+        referenceFps: Int = clientLimitReferenceFps
+    ) -> (width: Int, height: Int) {
+        guard fps > referenceFps, limit.width > 0, limit.height > 0 else { return limit }
+        let k = (Double(referenceFps) / Double(fps)).squareRoot()
         let w = max(16, Int((Double(limit.width) * k).rounded()) & ~15)
         let h = max(16, Int((Double(limit.height) * k).rounded()) & ~15)
         return (w, h)
+    }
+
+    /// The ceiling to encode within at `fps`. With a per-rate table (type
+    /// 14) it is the entry measured at the lowest rate at or above `fps`, and
+    /// beyond the table's fastest rate that entry scaled down by area. A
+    /// measured entry beats the single limit: that one is the smaller of the
+    /// panel and the 60 fps budget, so scaling it for faster streams shrank
+    /// panels whose decoder had budget to spare (issue #78). Without a table,
+    /// the single limit scaled as before. Nil when the client reported nothing.
+    static func budget(
+        limit: (width: Int, height: Int)?,
+        table: [Int: (width: Int, height: Int)]?,
+        forFps fps: Int
+    ) -> (width: Int, height: Int)? {
+        if let table = table, !table.isEmpty {
+            if let rate = table.keys.filter({ $0 >= fps }).min(), let entry = table[rate] {
+                return entry
+            }
+            if let top = table.keys.max(), let entry = table[top] {
+                return scaleLimit(entry, forFps: fps, referenceFps: top)
+            }
+        }
+        return limit.map { scaleLimit($0, forFps: fps) }
     }
 
     /// Clamp into a client-reported ceiling, transposing the box when its

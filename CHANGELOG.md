@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - Android: starting the demo while a connection attempt was still in progress left that attempt running in the background; it is now cancelled first.
+- Blurry picture on tablets whose stream was shrunk well below the panel (#78). The tablet now reports the size its decoder sustains at 30, 60 and 120 fps separately (new wire type 14, alongside the old single figure), and the Mac uses the entry for the rate it streams at instead of scaling the 60 fps figure — which on a 2800×1840 MatePad Air at 120 Hz turned the full panel into 1968×1280. Tablets whose H.264 decoder sustains a noticeably larger picture than their HEVC one (Honor Pad X9 and similar budget chips) now ask for H.264 at the larger size. Both apps need updating for the full effect; either side alone keeps the old behaviour.
 
 ### Changed
 - Android: release builds are now signed with a dedicated upload key (from CI secrets) instead of the debug key. Previously every CI build used a fresh debug key, so updating the APK required uninstalling the old one first. The first release after this change will also need a one-time uninstall.
