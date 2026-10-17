@@ -61,6 +61,67 @@ object CodecCapabilities {
     }
 
     /**
+     * HEVC 10-bit decode support of the usable hardware decoders. [main10] means some decoder
+     * advertises `HEVCProfileMain10` (or one of its HDR variants, which imply it); [hdr10Profile]
+     * means some decoder advertises `HEVCProfileMain10HDR10`/`HDR10Plus`, i.e. it also passes the
+     * static HDR metadata through to the display. Advertised to the Mac in type 15, where it gates
+     * HDR10 in `auto` mode.
+     */
+    data class Main10Support(
+        val main10: Boolean,
+        val hdr10Profile: Boolean,
+    )
+
+    private val main10Support: Main10Support by lazy { probeMain10Support() }
+
+    /** Cached: enumerating MediaCodecList is slow and the answer never changes at runtime. */
+    fun hevcMain10Support(): Main10Support = main10Support
+
+    private fun probeMain10Support(): Main10Support {
+        val mime = MediaFormat.MIMETYPE_VIDEO_HEVC
+        var main10 = false
+        var hdr10 = false
+        try {
+            for (info in MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos) {
+                if (!isUsableHardwareDecoder(info, mime)) continue
+                val profiles =
+                    try {
+                        info.getCapabilitiesForType(mime).profileLevels.map { it.profile }
+                    } catch (_: Exception) {
+                        continue
+                    }
+                val hasHdr10 = profiles.any { it in HEVC_HDR10_PROFILES }
+                main10 = main10 || hasHdr10 || MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 in profiles
+                hdr10 = hdr10 || hasHdr10
+            }
+        } catch (_: Exception) {
+            return Main10Support(main10 = false, hdr10Profile = false)
+        }
+        return Main10Support(main10 = main10, hdr10Profile = hdr10)
+    }
+
+    private val HEVC_HDR10_PROFILES =
+        setOf(
+            MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10,
+            MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus,
+        )
+
+    /**
+     * Whether the decoder [info] advertises [profile] for [mime]. False when the probe throws
+     * (unknown is treated as unsupported).
+     */
+    fun supportsProfile(
+        info: MediaCodecInfo,
+        mime: String,
+        profile: Int,
+    ): Boolean =
+        try {
+            info.getCapabilitiesForType(mime).profileLevels.any { it.profile == profile }
+        } catch (_: Exception) {
+            false
+        }
+
+    /**
      * How much larger (by area) the H.264 picture must be before it is worth its higher bitrate.
      * Below this the two codecs are treated as equivalent and HEVC keeps its bandwidth edge.
      */
@@ -136,8 +197,6 @@ object CodecCapabilities {
             null
         }
 
-    private const val BLOCK_ALIGN = 16
-
     /**
      * Frame rate the advertised stream limit is measured at. The client cannot know the Mac's
      * frame-rate setting when it advertises (that arrives later), and measuring at the panel's
@@ -174,7 +233,9 @@ object CodecCapabilities {
      * The panel is the upper bound because anything above it is downscaled on arrival anyway, so
      * spending decode budget there buys nothing. [MediaCodecInfo.VideoCapabilities.areSizeAndRateSupported]
      * is the check that consults `blocks-per-second`, which [nominalMaxDecodeSize] misses. Shrinks
-     * stepwise rather than solving directly because the budget counts aligned macroblocks.
+     * stepwise rather than solving directly because the budget counts aligned macroblocks. Sizes
+     * snap to the decoder's own alignment (2×2 on Qualcomm), not 16: HEVC/AVC crop non-aligned
+     * frames, so a 1080-line panel keeps 1080 lines instead of being cut to 1072 and rescaled.
      */
     fun maxStreamSize(
         mime: String,
@@ -189,10 +250,12 @@ object CodecCapabilities {
         var w = panelWidth.coerceAtMost(caps.supportedWidths.upper)
         var h = panelHeight.coerceAtMost(caps.supportedHeights.upper)
         val aspect = panelWidth.toDouble() / panelHeight.toDouble()
+        val alignW = caps.widthAlignment.coerceAtLeast(1)
+        val alignH = caps.heightAlignment.coerceAtLeast(1)
 
         repeat(40) {
-            val alignedW = (w / BLOCK_ALIGN) * BLOCK_ALIGN
-            val alignedH = (h / BLOCK_ALIGN) * BLOCK_ALIGN
+            val alignedW = (w / alignW) * alignW
+            val alignedH = (h / alignH) * alignH
             if (alignedW < 256 || alignedH < 256) return null
             val supported =
                 try {

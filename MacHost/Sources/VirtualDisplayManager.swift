@@ -18,18 +18,56 @@ class VirtualDisplayManager {
         return virtualDisplay != nil
     }
 
+    /// Whether the live display was created with the HDR (tf=1) mode list.
+    private(set) var isHDR = false
+
+    /// Physical pixel size of the live display's anchor mode, nil when none exists.
+    var physicalSize: (Int, Int)?
+    /// Mode the last create/re-mode asked for, selected explicitly by `applyPlannedMode`.
+    private struct PlannedMode { let width: Int, height: Int, hiDPI: Bool, refreshRate: Int }
+    private var plannedMode: PlannedMode?
+
+    /// Whether the private HDR mode initializer exists on this OS.
+    private static var supportsHDRModes: Bool {
+        CGVirtualDisplayMode.instancesRespond(
+            to: NSSelectorFromString("initWithWidth:height:refreshRate:transferFunction:"))
+    }
+
+    /// Mode list for a logical size; with HiDPI the 2× physical anchor mode comes first.
+    private static func makeModes(
+        width: Int, height: Int, refreshRate: Int, hiDPI: Bool, hdr: Bool
+    ) -> [CGVirtualDisplayMode] {
+        func mode(_ w: Int, _ h: Int) -> CGVirtualDisplayMode {
+            if hdr {
+                return CGVirtualDisplayMode(
+                    width: UInt32(w), height: UInt32(h),
+                    refreshRate: Double(refreshRate), transferFunction: 1)
+            }
+            return CGVirtualDisplayMode(width: UInt32(w), height: UInt32(h), refreshRate: Double(refreshRate))
+        }
+        // HiDPI: anchor mode (physical) + logical mode
+        // The anchor tells macOS "this display is high-density" → unlocks HiDPI for logical mode
+        // non-HiDPI: single mode at requested resolution
+        var modes: [CGVirtualDisplayMode] = []
+        if hiDPI { modes.append(mode(width * 2, height * 2)) }
+        modes.append(mode(width, height))
+        return modes
+    }
+
     /// Create a virtual display with specified configuration
     /// - Parameters:
     ///   - width: Display width in pixels
     ///   - height: Display height in pixels
     ///   - refreshRate: Refresh rate in Hz (default: 60)
     ///   - hiDPI: Enable HiDPI mode (default: false)
+    ///   - hdr: Request an HDR/EDR display (tf=1 modes, BT.2020 primaries); falls back to SDR if unsupported
     ///   - name: Display name (default: "Virtual Display")
     func createDisplay(
         width: Int,
         height: Int,
         refreshRate: Int = 60,
         hiDPI: Bool = false,
+        hdr: Bool = false,
         name: String = "Virtual Display"
     ) throws {
         // Clean up existing display if any
@@ -38,12 +76,22 @@ class VirtualDisplayManager {
         // Physical pixels = 2x logical when HiDPI, 1x otherwise
         let physW = hiDPI ? width * 2 : width
         let physH = hiDPI ? height * 2 : height
+        let useHDR = hdr && Self.supportsHDRModes
 
         // Create display descriptor
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.name = name
-        descriptor.maxPixelsWide = UInt32(physW)
-        descriptor.maxPixelsHigh = UInt32(physH)
+        // Square bounds so later in-place re-modes (rotation, fold switch) fit;
+        // applySettings: fails if a new mode exceeds either bound.
+        let maxBound = UInt32(min(max(physW, physH, 4096), 8192))
+        descriptor.maxPixelsWide = maxBound
+        descriptor.maxPixelsHigh = maxBound
+        if useHDR {
+            descriptor.redPrimary = CGPoint(x: 0.708, y: 0.292)
+            descriptor.greenPrimary = CGPoint(x: 0.170, y: 0.797)
+            descriptor.bluePrimary = CGPoint(x: 0.131, y: 0.046)
+            descriptor.whitePoint = CGPoint(x: 0.3127, y: 0.3290)
+        }
 
         // HiDPI needs high PPI so macOS recognises as Retina (≥200 PPI threshold)
         // non-HiDPI stays at 110 PPI (typical tablet assumption)
@@ -64,24 +112,8 @@ class VirtualDisplayManager {
         // Create display settings
         let settings = CGVirtualDisplaySettings()
         settings.hiDPI = hiDPI ? 1 : 0
-
-        // HiDPI: anchor mode (physical) + logical mode
-        // The anchor tells macOS "this display is high-density" → unlocks HiDPI for logical mode
-        // non-HiDPI: single mode at requested resolution
-        var modes: [CGVirtualDisplayMode] = []
-        if hiDPI {
-            modes.append(CGVirtualDisplayMode(
-                width: UInt32(physW),
-                height: UInt32(physH),
-                refreshRate: Double(refreshRate)
-            ))
-        }
-        modes.append(CGVirtualDisplayMode(
-            width: UInt32(width),
-            height: UInt32(height),
-            refreshRate: Double(refreshRate)
-        ))
-        settings.modes = modes
+        settings.modes = Self.makeModes(width: width, height: height,
+                                        refreshRate: refreshRate, hiDPI: hiDPI, hdr: useHDR)
 
         self.displaySettings = settings
 
@@ -92,15 +124,19 @@ class VirtualDisplayManager {
 
         self.virtualDisplay = display
 
-        // Apply settings
+        // Apply settings (`applySettings:` imports into Swift as `apply(_:)`)
         let result = display.apply(settings)
         if !result {
             destroyDisplay()
             throw VirtualDisplayError.settingsApplyFailed("Failed to apply settings")
         }
+        self.isHDR = useHDR
+        self.physicalSize = (physW, physH)
 
+        plannedMode = PlannedMode(width: width, height: height, hiDPI: hiDPI, refreshRate: refreshRate)
         let modeDesc = hiDPI ? "\(width)x\(height) HiDPI (physical \(physW)x\(physH))" : "\(width)x\(height)"
-        print("✅ Virtual display created: \(modeDesc) @ \(refreshRate)Hz (ID: \(display.displayID))")
+        debugLog("Virtual display created: \(modeDesc) @ \(refreshRate)Hz\(useHDR ? " HDR" : "") " +
+                 "(ID: \(display.displayID))")
 
         registerScreenParamsObserver()
     }
@@ -368,6 +404,100 @@ class VirtualDisplayManager {
         return found
     }
 
+    /// Re-mode the live display in place (same displayID, no destroy/recreate).
+    /// Keeps the transfer function chosen at creation. Returns false when there is
+    /// no display, the requested size exceeds the descriptor's pixel bounds, the
+    /// apply fails, or the display does not report the new mode within 500 ms.
+    func reconfigure(width: Int, height: Int, refreshRate: Int, hiDPI: Bool) -> Bool {
+        guard let display = virtualDisplay, let descriptor = displayDescriptor else { return false }
+        let physW = hiDPI ? width * 2 : width
+        let physH = hiDPI ? height * 2 : height
+        guard physW > 0, physH > 0,
+              UInt32(physW) <= descriptor.maxPixelsWide,
+              UInt32(physH) <= descriptor.maxPixelsHigh else { return false }
+
+        let settings = CGVirtualDisplaySettings()
+        settings.hiDPI = hiDPI ? 1 : 0
+        settings.modes = Self.makeModes(width: width, height: height,
+                                        refreshRate: refreshRate, hiDPI: hiDPI, hdr: isHDR)
+        guard display.apply(settings) else { return false }
+        displaySettings = settings
+        physicalSize = (physW, physH)
+        plannedMode = PlannedMode(width: width, height: height, hiDPI: hiDPI, refreshRate: refreshRate)
+
+        // WindowServer adopts its own default (the largest point size) after apply, so pick the
+        // exact points/pixels mode, then read it back rather than assuming it was adopted.
+        let id = display.displayID
+        guard Self.selectMode(displayID: id, width: width, height: height,
+                              hiDPI: hiDPI, refreshRate: refreshRate) else { return false }
+        let deadline = Date().addingTimeInterval(0.5)
+        while true {
+            if let mode = CGDisplayCopyDisplayMode(id),
+               Self.modeMatches(size: (mode.width, mode.height), pixels: (mode.pixelWidth, mode.pixelHeight),
+                                requested: (width, height), hiDPI: hiDPI) {
+                debugLog("Virtual display re-moded: \(width)x\(height)\(hiDPI ? " HiDPI" : "") " +
+                         "@ \(refreshRate)Hz (ID: \(id))")
+                return true
+            }
+            if Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    /// Selects the exact mode `createDisplay` asked for. WindowServer otherwise adopts its own
+    /// default (the largest point size: e.g. 1920×1080@2× for a 960×540 HiDPI request).
+    /// Call off the main thread once the display is online: it blocks, and WindowServer needs
+    /// the main run loop to publish the new display's mode list.
+    func applyPlannedMode() -> Bool {
+        guard let id = displayID, let plan = plannedMode else { return false }
+        return Self.selectMode(displayID: id, width: plan.width, height: plan.height,
+                               hiDPI: plan.hiDPI, refreshRate: plan.refreshRate)
+    }
+
+    /// Switches `displayID` to the mode showing `width`×`height` points at 2× (HiDPI) or 1×
+    /// pixels, closest to `refreshRate`. Waits up to 1 s for WindowServer to publish the mode
+    /// list after an apply. Blocks the calling thread for the mode switch (~300 ms measured on
+    /// macOS 27). Returns false when no such mode appears or the switch fails.
+    @discardableResult
+    static func selectMode(displayID: CGDirectDisplayID, width: Int, height: Int,
+                           hiDPI: Bool, refreshRate: Int) -> Bool {
+        let scale = hiDPI ? 2 : 1
+        let options = [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary
+        let deadline = Date().addingTimeInterval(1.0)
+        while true {
+            let modes = (CGDisplayCopyAllDisplayModes(displayID, options) as? [CGDisplayMode]) ?? []
+            let target = modes
+                .filter {
+                    $0.width == width && $0.height == height &&
+                        $0.pixelWidth == width * scale && $0.pixelHeight == height * scale
+                }
+                .min { abs($0.refreshRate - Double(refreshRate)) < abs($1.refreshRate - Double(refreshRate)) }
+            if let target {
+                if let current = CGDisplayCopyDisplayMode(displayID),
+                   current.width == width, current.height == height,
+                   current.pixelWidth == target.pixelWidth, current.pixelHeight == target.pixelHeight,
+                   abs(current.refreshRate - target.refreshRate) < 0.5 {
+                    return true
+                }
+                let error = CGDisplaySetDisplayMode(displayID, target, nil)
+                if error != .success { debugLog("CGDisplaySetDisplayMode failed: \(error.rawValue)") }
+                return error == .success
+            }
+            if Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+    }
+
+    /// Whether a read-back mode is the one `reconfigure` requested: the logical size must match,
+    /// and HiDPI additionally needs the 2× pixel size (WindowServer also offers 1× modes whose
+    /// pixel count equals a 2× request, e.g. 1920×1080@1x vs 960×540@2x).
+    static func modeMatches(size: (width: Int, height: Int), pixels: (width: Int, height: Int),
+                            requested: (width: Int, height: Int), hiDPI: Bool) -> Bool {
+        guard size.width == requested.width, size.height == requested.height else { return false }
+        let scale = hiDPI ? 2 : 1
+        return pixels.width == requested.width * scale && pixels.height == requested.height * scale
+    }
+
     /// Destroy the virtual display
     func destroyDisplay() {
         removeScreenParamsObserver()
@@ -375,6 +505,8 @@ class VirtualDisplayManager {
             virtualDisplay = nil
             displayDescriptor = nil
             displaySettings = nil
+            physicalSize = nil
+            isHDR = false
             print("🗑️  Virtual display destroyed")
         }
     }

@@ -8,7 +8,10 @@ import android.os.Process
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.DataInputStream
@@ -27,11 +30,16 @@ class StreamClient(
     private var socket: Socket? = null
     private var inputStream: DataInputStream? = null
     private var outputStream: java.io.DataOutputStream? = null
-    private var isConnected = false
 
-    // Callback includes actual frame size (may differ from buffer.size due to pooling),
-    // receive timestamp, and whether the frame can restart HEVC decoding.
-    var onFrameReceived: ((ByteArray, Int, Long, Boolean) -> Unit)? = null
+    @Volatile private var isConnected = false
+
+    /**
+     * Frame buffer, valid byte count (the pooled buffer may be larger), receive `System.nanoTime()`,
+     * whether the frame can restart decoding, and the host capture instant in the host clock
+     * (map it with [clockSync]); 0 when the host never sent a type 16, so its timestamps are not
+     * capture instants.
+     */
+    var onFrameReceived: ((ByteArray, Int, Long, Boolean, Long) -> Unit)? = null
     var onConnectionStatus: ((Boolean) -> Unit)? = null
     var onDisplaySize: ((Int, Int, Int, Boolean, Boolean) -> Unit)? = null
 
@@ -50,13 +58,41 @@ class StreamClient(
     @Volatile var codecNegotiated = false
         private set
 
+    /** Latest type 16, null until a host that supports it sends one. */
+    @Volatile var streamFormat: StreamFormat? = null
+        private set
+
+    /** Fired on the receive thread for every valid type 16. */
+    var onStreamFormat: ((StreamFormat) -> Unit)? = null
+
+    /** Host↔client clock estimate fed by the type-17/18 exchange. */
+    val clockSync = ClockSyncEstimator()
+
+    /** (offsetNs, minRttNs) after every type-18 sample, on the receive thread. */
+    var onClockSync: ((Long, Long) -> Unit)? = null
+
+    /**
+     * Queried at connect (and once more right after) for the type-15 advertisement. Null provider
+     * or null result: no type 15 at connect, and the host stays on SDR / its own display size.
+     */
+    var capabilitiesProvider: (() -> ClientCapabilities?)? = null
+
+    private val capabilitiesLock = Any()
+    private var lastAdvertisedCapabilities: ClientCapabilities? = null
+
+    @Volatile private var clockSyncJob: Job? = null
+
+    // Receive-thread only.
+    private val streamFormatPayload = ByteArray(StreamFormat.WIRE_SIZE)
+    private val clockSyncPayload = ByteArray(ClockSyncWire.RESPONSE_SIZE)
+    private var clockSyncLogged = false
+
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
     private var lastStatsTime = System.currentTimeMillis()
     private val keyframeRequestLock = Any()
     private var lastKeyframeRequestNs = 0L
-    private var lastKeyframeReceivedNs = 0L
 
     // Buffer pooling to reduce GC pressure from per-frame allocations
     // At 60fps with ~100KB frames, this prevents ~6MB/s of allocations
@@ -79,7 +115,7 @@ class StreamClient(
             }
         }
         // No suitable buffer found, allocate new one
-        return ByteArray(minSize)
+        return ByteArray(maxOf(minSize, 64 * 1024))
     }
 
     /**
@@ -91,8 +127,13 @@ class StreamClient(
             // Keep pool size limited to prevent memory bloat
             if (bufferPool.size < 8) {
                 bufferPool.addLast(buffer)
+            } else {
+                val minIdx = bufferPool.indices.minByOrNull { bufferPool[it].size } ?: return
+                if (buffer.size > bufferPool[minIdx].size) {
+                    bufferPool.removeAt(minIdx)
+                    bufferPool.addLast(buffer)
+                }
             }
-            // If pool is full, let buffer be GC'd
         }
     }
 
@@ -126,20 +167,21 @@ class StreamClient(
                     Socket(host, port).apply {
                         tcpNoDelay = true
                     }
-                inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), 65536))
+                inputStream = DataInputStream(java.io.BufferedInputStream(socket?.getInputStream(), INPUT_BUFFER_SIZE))
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
                 prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseCapabilitiesAtConnect() // After 14, before 8: the host negotiates format from it
                 advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
-                lastKeyframeReceivedNs = 0L
                 synchronized(keyframeRequestLock) {
                     lastKeyframeRequestNs = 0L
                 }
+                readvertiseCapabilitiesIfChanged()
 
                 diagLog("Connected to $host:$port")
                 onConnectionStatus?.invoke(true)
@@ -351,16 +393,18 @@ class StreamClient(
         when (status) {
             AuthHandshake.ResponseStatus.OK -> {
                 socket = s
-                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), 65536))
+                inputStream = DataInputStream(java.io.BufferedInputStream(s.getInputStream(), INPUT_BUFFER_SIZE))
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
                 prepareAdvertisements()
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseCapabilitiesAtConnect() // After 14, before 8: the host negotiates format from it
                 advertiseDesktopGeometrySupport() // Likewise
                 advertiseFrameMetadataSupport()
                 isConnected = true
+                readvertiseCapabilitiesIfChanged()
                 diagLog("Wireless connected to $host:$port")
                 onConnectionStatus?.invoke(true)
                 receiveData()
@@ -398,6 +442,93 @@ class StreamClient(
         }
     }
 
+    /** Type 15 inside the connect sequence, before [isConnected] opens mid-session writes. */
+    private fun advertiseCapabilitiesAtConnect() {
+        val caps = capabilitiesProvider?.invoke() ?: return
+        synchronized(capabilitiesLock) {
+            outputStream?.let { writeCapabilities(it, caps) }
+        }
+    }
+
+    /** Queries the provider once more after connecting, catching a change that landed mid-handshake. */
+    private fun readvertiseCapabilitiesIfChanged() {
+        capabilitiesProvider?.invoke()?.let { advertiseCapabilities(it) }
+    }
+
+    /**
+     * Type 15 mid-session (rotation, fold switch, cutout mode change). Safe from any thread: the
+     * write runs on the touch thread with every other client→host message, and an advert equal to
+     * the last one sent is dropped. Ignored while disconnected; the connect sequence asks
+     * [capabilitiesProvider] instead.
+     */
+    fun advertiseCapabilities(caps: ClientCapabilities) {
+        if (!isConnected) return
+        touchScope.launch {
+            try {
+                synchronized(capabilitiesLock) {
+                    val out = outputStream
+                    if (out != null && isConnected && caps != lastAdvertisedCapabilities) {
+                        writeCapabilities(out, caps)
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** Caller holds [capabilitiesLock]. One write so the 13 bytes never interleave with others. */
+    private fun writeCapabilities(
+        out: java.io.DataOutputStream,
+        caps: ClientCapabilities,
+    ) {
+        out.write(byteArrayOf(MESSAGE_CLIENT_CAPABILITIES.toByte()) + caps.encode())
+        out.flush()
+        lastAdvertisedCapabilities = caps
+        diagLog("Advertised capabilities $caps")
+    }
+
+    private fun handleStreamFormat(format: StreamFormat) {
+        if (format != streamFormat) diagLog("Stream format: $format")
+        streamFormat = format
+        if (format.hostSupportsClockSync) startClockSync()
+        onStreamFormat?.invoke(format)
+    }
+
+    /** Type 17 every 100 ms for the first 2 s, then every 500 ms, until disconnect. Idempotent. */
+    private fun startClockSync() {
+        if (!isConnected || clockSyncJob?.isActive == true) return
+        clockSyncJob =
+            touchScope.launch {
+                val start = System.nanoTime()
+                while (isActive && isConnected) {
+                    val out = outputStream ?: break
+                    try {
+                        out.write(ClockSyncWire.encodeRequest(System.nanoTime()))
+                        out.flush()
+                    } catch (_: IOException) {
+                        break
+                    }
+                    val inBurst = System.nanoTime() - start < CLOCK_SYNC_BURST_NS
+                    delay(if (inBurst) CLOCK_SYNC_BURST_INTERVAL_MS else CLOCK_SYNC_STEADY_INTERVAL_MS)
+                }
+            }
+    }
+
+    /** Type 18 payload follows the type byte; t3 is taken as soon as it is fully read. */
+    private fun receiveClockSyncResponse(input: DataInputStream) {
+        input.readFully(clockSyncPayload)
+        val t3 = System.nanoTime()
+        val (t0, t1, t2) = ClockSyncWire.parseResponse(clockSyncPayload)
+        clockSync.addSample(t0, t1, t2, t3)
+        val offset = clockSync.offsetNs ?: return
+        val minRtt = clockSync.minRttNs ?: return
+        if (!clockSyncLogged && clockSync.isConfident) {
+            clockSyncLogged = true
+            diagLog("Clock sync: offset=${offset}ns, minRtt=${minRtt / 1000}us")
+        }
+        onClockSync?.invoke(offset, minRtt)
+    }
+
     /** Panel and codec the current connection advertises; fixed once per connect so every message agrees. */
     private var panel: PanelGeometry? = null
     private var negotiationMime: String = MediaFormat.MIMETYPE_VIDEO_HEVC
@@ -407,6 +538,12 @@ class StreamClient(
         val fallback =
             if (CodecCapabilities.hasHevcDecoder) MediaFormat.MIMETYPE_VIDEO_HEVC else MediaFormat.MIMETYPE_VIDEO_AVC
         negotiationMime = panel?.let { CodecCapabilities.preferredStreamMime(it.width, it.height) } ?: fallback
+        streamFormat = null
+        clockSync.reset()
+        clockSyncLogged = false
+        synchronized(capabilitiesLock) {
+            lastAdvertisedCapabilities = null
+        }
     }
 
     private fun advertiseAvcOnlyIfNeeded() {
@@ -469,6 +606,10 @@ class StreamClient(
     private suspend fun receiveData() =
         withContext(Dispatchers.IO) {
             val input = inputStream ?: return@withContext
+            try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_DISPLAY)
+            } catch (_: Exception) {
+            }
 
             try {
                 while (isConnected) {
@@ -516,6 +657,20 @@ class StreamClient(
                             codecNegotiated = true
                             diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
                             onCodecSelected?.invoke(streamCodecIsHevc)
+                        }
+
+                        MESSAGE_STREAM_FORMAT -> {
+                            input.readFully(streamFormatPayload)
+                            val format = StreamFormat.parse(streamFormatPayload)
+                            if (format != null) {
+                                handleStreamFormat(format)
+                            } else {
+                                diagLog("Ignoring unsupported stream format ${streamFormatPayload.contentToString()}")
+                            }
+                        }
+
+                        ClockSyncWire.MESSAGE_RESPONSE -> {
+                            receiveClockSyncResponse(input)
                         }
 
                         else -> {
@@ -661,10 +816,13 @@ class StreamClient(
         }
 
         var isKeyframe = false
+        var hostCaptureNs = 0L
         if (hasMetadata) {
             val flags = input.readUnsignedByte()
-            input.readLong() // Host capture timestamp; clocks are not comparable with Android.
+            val timestamp = input.readLong()
             isKeyframe = (flags and FRAME_FLAG_KEYFRAME) != 0
+            // Only hosts that send type 16 stamp the capture instant in the clock type 18 reports.
+            if (streamFormat != null) hostCaptureNs = timestamp
         }
 
         val frameData = acquireBuffer(frameSize)
@@ -676,7 +834,6 @@ class StreamClient(
 
         // Capture timestamp after full frame received for accurate age tracking.
         val receiveTimestamp = System.nanoTime()
-        checkKeyframeFreshness(receiveTimestamp, isKeyframe)
         diagFrameCount++
         if (diagFrameCount == 1L) {
             diagLog(
@@ -690,31 +847,11 @@ class StreamClient(
 
         val callback = onFrameReceived
         if (callback != null) {
-            callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe)
+            callback.invoke(frameData, frameSize, receiveTimestamp, isKeyframe, hostCaptureNs)
         } else {
             releaseBuffer(frameData)
         }
         updateStats(frameSize)
-    }
-
-    private fun checkKeyframeFreshness(
-        receiveTimestamp: Long,
-        isKeyframe: Boolean,
-    ) {
-        if (isKeyframe) {
-            lastKeyframeReceivedNs = receiveTimestamp
-            return
-        }
-
-        val lastKeyframeNs = lastKeyframeReceivedNs
-        if (lastKeyframeNs <= 0L) return
-
-        val keyframeAgeNs = receiveTimestamp - lastKeyframeNs
-        if (keyframeAgeNs > KEYFRAME_STALE_INTERVAL_NS) {
-            requestKeyframe(
-                reason = "last keyframe ${keyframeAgeNs / 1_000_000L}ms ago",
-            )
-        }
     }
 
     fun disconnect() {
@@ -725,6 +862,8 @@ class StreamClient(
     }
 
     private fun cleanup() {
+        clockSyncJob?.cancel()
+        clockSyncJob = null
         try {
             outputStream?.close()
             inputStream?.close()
@@ -758,9 +897,15 @@ class StreamClient(
         // Only a desync guard — acquireBuffer allocates the real frame size, so a generous bound
         // costs nothing. Must clear a keyframe at panel resolution and the highest offered bitrate.
         private const val MAX_FRAME_SIZE = 32 * 1024 * 1024 // 32MB
+
+        // 8 KB buffers headers into a single read() while allowing video frames (>= 8 KB) to
+        // bypass BufferedInputStream's internal array and read directly into frameData.
+        private const val INPUT_BUFFER_SIZE = 8 * 1024
         private const val PAIRING_READ_TIMEOUT_MS = 10_000
+        private const val CLOCK_SYNC_BURST_NS = 2_000_000_000L
+        private const val CLOCK_SYNC_BURST_INTERVAL_MS = 100L
+        private const val CLOCK_SYNC_STEADY_INTERVAL_MS = 500L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
-        private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7
@@ -771,6 +916,8 @@ class StreamClient(
         private const val MESSAGE_CLIENT_SUPPORTS_DESKTOP_GEOMETRY = 12
         private const val MESSAGE_DESKTOP_GEOMETRY = 13
         private const val MESSAGE_CLIENT_DECODER_LIMIT_TABLE = 14
+        private const val MESSAGE_CLIENT_CAPABILITIES = 15
+        private const val MESSAGE_STREAM_FORMAT = 16
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

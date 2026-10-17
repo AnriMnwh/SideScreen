@@ -1,103 +1,125 @@
 package com.sidescreen.app
 
-import android.os.SystemClock
-
 /**
- * Predicts touch input position based on velocity to reduce perceived latency
- * Critical for FPS gaming where every millisecond counts
+ * Single-finger touch prediction: extrapolates the newest sample along a least-squares velocity
+ * fitted over the recent samples (including the batched historical ones of each MotionEvent), so
+ * the host sees the finger roughly where it is by the time the frame showing it comes back.
+ *
+ * Coordinates are the 0..1 stream space; times are nanoseconds in the [nowNs] clock domain (on
+ * Android `System.nanoTime()` and `MotionEvent` times share CLOCK_MONOTONIC). Not thread-safe:
+ * use from the UI thread only. Allocation-free after construction.
  */
-class InputPredictor {
-    private data class TouchSample(
-        val x: Float,
-        val y: Float,
-        // Timestamp in nanoseconds
-        val timestamp: Long,
-    )
+class InputPredictor(
+    private val nowNs: () -> Long = System::nanoTime,
+    private val maxSamples: Int = 8,
+) {
+    init {
+        require(maxSamples >= 2) { "maxSamples must be at least 2" }
+    }
 
-    private val history = ArrayDeque<TouchSample>(5)
-    private val minSamplesForPrediction = 2
+    private val xs = FloatArray(maxSamples)
+    private val ys = FloatArray(maxSamples)
+    private val ts = LongArray(maxSamples)
+    private var next = 0
+    private var count = 0
 
-    /**
-     * Add a new touch sample to the history
-     */
+    /** Result of the last [predict]. */
+    var predictedX = 0f
+        private set
+    var predictedY = 0f
+        private set
+
+    /** Adds a sample; out-of-order or duplicate timestamps are ignored so the fit stays well-posed. */
     fun addSample(
         x: Float,
         y: Float,
+        timeNs: Long,
     ) {
-        val timestamp = SystemClock.elapsedRealtimeNanos()
-        history.addLast(TouchSample(x, y, timestamp))
-
-        // Keep only last 5 samples for velocity calculation
-        if (history.size > 5) {
-            history.removeFirst()
-        }
+        if (count > 0 && timeNs <= ts[newestIndex()]) return
+        xs[next] = x
+        ys[next] = y
+        ts[next] = timeNs
+        next = (next + 1) % maxSamples
+        if (count < maxSamples) count++
     }
 
     /**
-     * Predict position after given latency in milliseconds
-     * Uses linear extrapolation based on recent velocity
-     *
-     * @param latencyMs Expected latency in milliseconds (typically 10-20ms)
-     * @return Pair of predicted (x, y) coordinates
+     * Predicts the position [leadMs] after now into [predictedX]/[predictedY], clamped to 0..1.
+     * Falls back to the newest sample when there is too little recent history to trust a velocity.
      */
-    fun predictPosition(latencyMs: Float): Pair<Float, Float> {
-        if (history.size < minSamplesForPrediction) {
-            // Not enough data, return last known position
-            return if (history.isEmpty()) {
-                Pair(0f, 0f)
-            } else {
-                Pair(history.last().x, history.last().y)
-            }
+    fun predict(leadMs: Float) {
+        if (count == 0) {
+            predictedX = 0f
+            predictedY = 0f
+            return
         }
+        val newest = newestIndex()
+        val lastX = xs[newest]
+        val lastY = ys[newest]
+        predictedX = lastX
+        predictedY = lastY
 
-        // Calculate velocity from last 2 samples (most recent)
-        val prev = history[history.size - 2]
-        val curr = history.last()
-
-        // Time delta in milliseconds
-        val dt = (curr.timestamp - prev.timestamp) / 1_000_000f
-
-        if (dt < 0.1f) {
-            // Samples too close together, might be noise
-            return Pair(curr.x, curr.y)
+        // Least-squares slope over samples no older than FIT_WINDOW_NS before the newest.
+        val tNewest = ts[newest]
+        var n = 0
+        var sumT = 0.0
+        var sumX = 0.0
+        var sumY = 0.0
+        var sumTT = 0.0
+        var sumTX = 0.0
+        var sumTY = 0.0
+        var i = newest
+        var visited = 0
+        while (visited < count) {
+            val dtNs = tNewest - ts[i]
+            if (dtNs > FIT_WINDOW_NS) break // older samples are older still
+            val t = -dtNs / 1_000_000.0 // ms relative to the newest sample, keeps the sums small
+            n++
+            sumT += t
+            sumX += xs[i]
+            sumY += ys[i]
+            sumTT += t * t
+            sumTX += t * xs[i]
+            sumTY += t * ys[i]
+            i = if (i == 0) maxSamples - 1 else i - 1
+            visited++
         }
+        if (n < 2) return
+        val denom = n * sumTT - sumT * sumT
+        if (denom < MIN_TIME_SPREAD_MS2 * n * n) return // samples (nearly) simultaneous: no usable velocity
+        val vx = (n * sumTX - sumT * sumX) / denom // units per ms
+        val vy = (n * sumTY - sumT * sumY) / denom
 
-        // Velocity in units per millisecond
-        val vx = (curr.x - prev.x) / dt
-        val vy = (curr.y - prev.y) / dt
-
-        // Extrapolate forward by latency amount
-        val predictedX = curr.x + (vx * latencyMs)
-        val predictedY = curr.y + (vy * latencyMs)
-
-        return Pair(predictedX, predictedY)
+        // Horizon: how stale the newest sample already is, plus the requested lead.
+        val staleMs = ((nowNs() - tNewest) / 1_000_000.0).coerceIn(0.0, MAX_STALENESS_MS)
+        val horizon = staleMs + leadMs.coerceAtLeast(0f)
+        predictedX = (lastX + vx * horizon).toFloat().coerceIn(0f, 1f)
+        predictedY = (lastY + vy * horizon).toFloat().coerceIn(0f, 1f)
     }
 
-    /**
-     * Get current velocity in units per second
-     * Useful for debugging and adaptive latency compensation
-     */
-    fun getCurrentVelocity(): Pair<Float, Float> {
-        if (history.size < 2) return Pair(0f, 0f)
-
-        val prev = history[history.size - 2]
-        val curr = history.last()
-        val dt = (curr.timestamp - prev.timestamp) / 1_000_000_000f // nanoseconds to seconds
-
-        return if (dt > 0) {
-            Pair(
-                (curr.x - prev.x) / dt,
-                (curr.y - prev.y) / dt,
-            )
-        } else {
-            Pair(0f, 0f)
-        }
-    }
-
-    /**
-     * Reset predictor state (call when touch sequence ends)
-     */
     fun reset() {
-        history.clear()
+        next = 0
+        count = 0
+    }
+
+    private fun newestIndex() = if (next == 0) maxSamples - 1 else next - 1
+
+    companion object {
+        /** Samples older than this before the newest one no longer describe the current stroke. */
+        const val FIT_WINDOW_NS = 50_000_000L
+
+        /** Never extrapolate a sample older than this; a stalled finger must not keep sliding. */
+        const val MAX_STALENESS_MS = 8.0
+
+        /** Minimum variance of the sample times (ms²) for a velocity to be meaningful. */
+        private const val MIN_TIME_SPREAD_MS2 = 0.25
+
+        const val MAX_LEAD_MS = 8f
+
+        /** Lead = min(8 ms, minRtt / 2 + 2 ms): about the one-way trip; the cap when RTT is unknown. */
+        fun leadMsFor(minRttMs: Double?): Float {
+            if (minRttMs == null || minRttMs.isNaN() || minRttMs < 0) return MAX_LEAD_MS
+            return minOf(MAX_LEAD_MS, (minRttMs / 2 + 2).toFloat())
+        }
     }
 }

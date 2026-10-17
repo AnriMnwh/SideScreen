@@ -24,7 +24,7 @@
 ![Swift](https://img.shields.io/badge/Swift-FA7343?style=for-the-badge&logo=swift&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?style=for-the-badge&logo=kotlin&logoColor=white)
 ![macOS](https://img.shields.io/badge/macOS_13+-000000?style=for-the-badge&logo=apple&logoColor=white)
-![Android](https://img.shields.io/badge/Android_8+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
+![Android](https://img.shields.io/badge/Android_13+-3DDC84?style=for-the-badge&logo=android&logoColor=white)
 ![Universal Binary](https://img.shields.io/badge/Universal_Binary-Apple_Silicon_+_Intel-000000?style=for-the-badge&logo=apple&logoColor=white)
 
 </div>
@@ -81,13 +81,21 @@ Use your tablet's touchscreen to interact with macOS. Touch prediction compensat
 
 Enable HiDPI mode to render at 2× resolution internally — text and icons are sharp at any logical resolution, just like a MacBook Retina display. Perfect for users with 2K/4K tablets who want a readable workspace without sacrificing sharpness.
 
+### HDR10
+
+HEVC Main10 with HDR10 metadata when the phone can decode it and the Mac runs macOS 26 or later. Auto / On / Off in the Mac settings; otherwise the stream is SDR.
+
+### Match Device Display
+
+The Mac's virtual display takes the phone's current orientation and size and re-modes live when you rotate or fold the phone. Foldables get a tabletop layout, and the Android app has Orientation and Camera cutout settings. A latency overlay (E2E p50/p95 · decode · RTT) is available on the phone.
+
 ### Gaming Mode
 
-Enable Gaming Boost for optimized settings: 1 Gbps bitrate, ultra-low latency encoding, 120 FPS.
+Enable Gaming Boost for optimized settings: 150 Mbps bitrate, ultra-low latency encoding, 120 FPS.
 
 ### Customizable
 
-Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–5000 Mbps), and quality presets from the Mac app.
+Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–500 Mbps), HDR, and quality presets from the Mac app.
 
 <div align="center">
   <img src="resources/screenshots/mac_settings_1.png" alt="macOS Settings — Display & FPS" height="500"/>
@@ -109,7 +117,7 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 
 | | macOS Host | Android Client |
 |---|---|---|
-| **OS** | macOS 13 (Ventura)+ | Android 8.0 (API 26)+ |
+| **OS** | macOS 13 (Ventura)+ (macOS 26+ for HDR) | Android 13 (API 33)+ |
 | **Hardware** | Apple Silicon or Intel | H.265 hardware decoder |
 | **USB mode** | USB-C port + `adb` (`brew install android-platform-tools`) | USB-C cable + USB Debugging enabled |
 | **Wireless mode** | Same WiFi network as the tablet (5 GHz recommended) | Camera (for QR scan) + Google Play Services (for ML Kit barcode) |
@@ -190,12 +198,16 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 
 | Setting | Options | Default |
 |---------|---------|---------|
-| Resolution | 720p to 8K, 30+ presets + custom | 1920x1200 |
+| Resolution | 720p to 8K, 30+ presets + custom (disabled while Match device is on) | 1920x1200 |
 | Frame Rate | 30, 60, 90, 120 FPS | 120 |
-| Bitrate | 20–5000 Mbps | 1000 Mbps |
+| Bitrate | 20–500 Mbps | 80 Mbps |
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
-| HiDPI (Retina) | On/Off | Off |
-| Gaming Boost | On/Off (1 Gbps, 120 Hz) | Off |
+| HiDPI (Retina) | On/Off | On |
+| Gaming Boost | On/Off (150 Mbps, 120 Hz) | Off |
+| HDR | Auto, On, Off (HDR capture needs macOS 26+; falls back to SDR) | Auto |
+| Match device display | On/Off (host display follows the phone's orientation and size) | On |
+| Android: Orientation | Auto, Portrait, Landscape | Auto |
+| Android: Camera cutout | Fill to edges, Avoid | Fill |
 | Touch Input | On/Off | On |
 
 ---

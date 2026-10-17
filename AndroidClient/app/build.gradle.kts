@@ -13,7 +13,7 @@ android {
 
     defaultConfig {
         applicationId = "com.sidescreen.app"
-        minSdk = 26
+        minSdk = 33
         targetSdk = 36
         versionCode = computedVersionCode
         versionName = appVersion
@@ -70,6 +70,12 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
 }
 
 dependencies {
@@ -78,13 +84,14 @@ dependencies {
     implementation("com.google.android.material:material:1.11.0")
     implementation("androidx.constraintlayout:constraintlayout:2.1.4")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    implementation("androidx.window:window:1.3.0")
 
     // Wireless mode (0.8.0)
-    implementation("androidx.camera:camera-core:1.3.1")
-    implementation("androidx.camera:camera-camera2:1.3.1")
-    implementation("androidx.camera:camera-lifecycle:1.3.1")
-    implementation("androidx.camera:camera-view:1.3.1")
-    implementation("com.google.mlkit:barcode-scanning:17.2.0")
+    implementation("androidx.camera:camera-core:1.4.1")
+    implementation("androidx.camera:camera-camera2:1.4.1")
+    implementation("androidx.camera:camera-lifecycle:1.4.1")
+    implementation("androidx.camera:camera-view:1.4.1")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     // Flexible in-app updates for Play-installed builds (0.11.6)
     implementation("com.google.android.play:app-update-ktx:2.1.0")

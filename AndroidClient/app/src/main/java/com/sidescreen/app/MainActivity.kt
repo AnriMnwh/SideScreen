@@ -6,13 +6,13 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
 import android.media.MediaFormat
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -23,6 +23,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.TextureView
 import android.view.View
+import android.view.ViewGroup
 import android.view.Window
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -31,8 +32,12 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.constraintlayout.widget.ConstraintLayout
 import androidx.constraintlayout.widget.ConstraintSet
+import androidx.core.graphics.Insets
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.lifecycle.lifecycleScope
 import com.google.android.material.button.MaterialButton
+import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
@@ -81,8 +86,44 @@ class MainActivity : AppCompatActivity() {
     private var overlayDx = 0f
     private var overlayDy = 0f
 
-    // Input prediction for low-latency gaming
+    // Input prediction for low-latency gaming (UI thread only)
     private val inputPredictor = InputPredictor()
+
+    /** False after a DOWN outside the picture: the rest of that gesture is not sent. */
+    private var touchGestureActive = false
+
+    // Presentation geometry → type 15, and fold posture → tabletop layout; live only during a session.
+    private lateinit var panelWatcher: PanelWatcher
+    private lateinit var postureController: FoldPostureController
+    private var postureJob: Job? = null
+    private var posture: Posture = Posture.Flat
+
+    /** Last capabilities measured on the main thread; read by StreamClient's connect sequence on IO. */
+    @Volatile private var latestCapabilities: ClientCapabilities? = null
+
+    /** Camera cutout insets of the window, applied as video margins in [CutoutMode.AVOID]. */
+    private var cutoutInsets: Insets = Insets.NONE
+
+    // Latency overlay. Timeline written on the socket thread, stats on the decoder thread.
+    private val frameTimeline = FrameTimeline()
+    private val e2eRenderedStats = LatencyStats(120)
+    private val e2eDecodedStats = LatencyStats(120)
+    private val decodeStats = LatencyStats(120)
+
+    @Volatile private var pingRttMs = -1.0
+
+    @Volatile private var lastFrameRecvNs = 0L
+    private var lastRenderedTotal = 0L
+    private var lastDecodedTotal = 0L
+    private var overlayLogTicks = 0
+    private val latencyHandler = Handler(Looper.getMainLooper())
+    private val latencyOverlayRunnable =
+        object : Runnable {
+            override fun run() {
+                updateLatencyOverlay()
+                latencyHandler.postDelayed(this, LATENCY_OVERLAY_INTERVAL_MS)
+            }
+        }
 
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
@@ -109,15 +150,19 @@ class MainActivity : AppCompatActivity() {
         // Keep screen on
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
-        // Enable edge-to-edge display (draw behind system bars and cutout)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            window.attributes.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        }
+        // Edge-to-edge on every edge, cutout included: the safe area is applied as video margins
+        // (see applyVideoMargins) according to the user's cutout mode, not by the window manager.
+        window.attributes.layoutInDisplayCutoutMode =
+            WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         appUpdater = AppUpdater(this)
+        panelWatcher = PanelWatcher(this) { prefs.cutoutMode }
+        postureController = FoldPostureController(this)
+        setupWindowInsets()
+        // Warm the Main10 probe (a MediaCodecList walk) off the main thread before the first advert.
+        lifecycleScope.launch(Dispatchers.IO) { CodecCapabilities.hevcMain10Support() }
 
         // Apply fullscreen mode immediately
         enableFullscreenMode()
@@ -134,6 +179,91 @@ class MainActivity : AppCompatActivity() {
         startChecklistUpdates()
         setupModeToggle()
         setupWirelessController()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        panelWatcher.notifyConfigurationChanged()
+    }
+
+    /**
+     * Gesture-navigation and system-bar insets never shrink the video (the bars are hidden while
+     * streaming); only the camera cutout does, and only in [CutoutMode.AVOID].
+     */
+    private fun setupWindowInsets() {
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { _, insets ->
+            cutoutInsets = insets.getInsetsIgnoringVisibility(WindowInsetsCompat.Type.displayCutout())
+            applyVideoMargins()
+            panelWatcher.notifyInsetsChanged()
+            insets
+        }
+    }
+
+    /** Video margins: cutout insets in AVOID (0 in FILL), plus the lower half in tabletop posture. */
+    private fun applyVideoMargins() {
+        val avoid = prefs.cutoutMode == CutoutMode.AVOID
+        val left = if (avoid) cutoutInsets.left else 0
+        val top = if (avoid) cutoutInsets.top else 0
+        val right = if (avoid) cutoutInsets.right else 0
+        var bottom = if (avoid) cutoutInsets.bottom else 0
+        val rootHeight = binding.root.height
+        val p = posture
+        if (p is Posture.Tabletop && isStreamingUi && p.hingeTopPx in 1 until rootHeight) {
+            bottom = maxOf(bottom, rootHeight - p.hingeTopPx)
+        }
+        for (v in arrayOf(binding.surfaceView, binding.textureView)) {
+            val lp = v.layoutParams as ViewGroup.MarginLayoutParams
+            if (lp.leftMargin != left || lp.topMargin != top || lp.rightMargin != right || lp.bottomMargin != bottom) {
+                lp.setMargins(left, top, right, bottom)
+                v.layoutParams = lp
+            }
+        }
+    }
+
+    /** Session start (main thread): measure the first advert, follow geometry and posture changes. */
+    private fun startSessionObservers() {
+        latestCapabilities = panelWatcher.current()?.toCapabilities(CodecCapabilities.hevcMain10Support())
+        panelWatcher.start { geometry ->
+            val caps = geometry.toCapabilities(CodecCapabilities.hevcMain10Support())
+            latestCapabilities = caps
+            mainDiag("Presentation geometry ${geometry.width}x${geometry.height}")
+            streamClient?.advertiseCapabilities(caps)
+        }
+        postureJob?.cancel()
+        // Posture changes only re-lay the video out: re-advertising would re-mode the host
+        // (a picture gap) every time a foldable is opened a little further.
+        postureJob = postureController.observe(lifecycleScope) { onPosture(it) }
+    }
+
+    private fun stopSessionObservers() {
+        panelWatcher.stop()
+        postureJob?.cancel()
+        postureJob = null
+        if (posture != Posture.Flat) onPosture(Posture.Flat)
+    }
+
+    private fun onPosture(newPosture: Posture) {
+        mainDiag("Posture: $newPosture")
+        posture = newPosture
+        applyVideoMargins()
+        applyPostureControls()
+    }
+
+    /** Tabletop: settings button and stats overlay docked in the lower half, below the hinge. */
+    private fun applyPostureControls() {
+        val p = posture
+        if (p is Posture.Tabletop && isStreamingUi) {
+            updateSettingsButtonPosition(SETTINGS_POSITION_BOTTOM_CENTER)
+            val overlay = binding.statusBar
+            overlay.post {
+                val margin = 16 * resources.displayMetrics.density
+                overlay.x = margin
+                overlay.y = (p.hingeTopPx + margin).coerceAtMost(binding.root.height - overlay.height.toFloat())
+            }
+        } else {
+            restoreSettingsButtonPosition()
+            restoreOverlayXY()
+        }
     }
 
     private fun setupModeToggle() {
@@ -267,33 +397,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Enable fullscreen immersive mode
-     * Uses modern WindowInsets API on Android R+ for better system compatibility
-     * Also handles display cutout (notch) to use full screen area
+     * Immersive sticky: draw behind the system bars, hide them, let a swipe show them transiently.
+     * The cutout mode is fixed to ALWAYS in onCreate; the safe area is applyVideoMargins' job.
      */
     private fun enableFullscreenMode() {
-        // Ensure we draw behind the cutout
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            window.attributes.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.setDecorFitsSystemWindows(false)
-            window.insetsController?.let { controller ->
-                controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-                controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-            }
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = (
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    or View.SYSTEM_UI_FLAG_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            )
+        // Deprecated at API 35, where edge-to-edge is the default; still required on 33-34.
+        @Suppress("DEPRECATION")
+        window.setDecorFitsSystemWindows(false)
+        window.insetsController?.let { controller ->
+            controller.hide(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
+            controller.systemBarsBehavior = WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
     }
 
@@ -301,12 +414,7 @@ class MainActivity : AppCompatActivity() {
      * Disable fullscreen mode (when disconnected)
      */
     private fun disableFullscreenMode() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
-        } else {
-            @Suppress("DEPRECATION")
-            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
-        }
+        window.insetsController?.show(WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars())
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -484,6 +592,7 @@ class MainActivity : AppCompatActivity() {
         setSurfaceAspect("${DemoPlayer.WIDTH}:${DemoPlayer.HEIGHT}")
         updateResolutionOverlay()
         binding.resolutionText.append(" (demo)")
+        binding.latencyLabel.text = "LATENCY"
         binding.latencyText.text = "—"
         updateOverlayVisibility(prefs.showStatsOverlay)
         initializeDecoderForCurrentSurface()
@@ -523,10 +632,17 @@ class MainActivity : AppCompatActivity() {
         resetOrientationToSensor()
     }
 
+    /**
+     * Letterboxes the video views to the stream's aspect inside their margins, so the picture fills
+     * exactly StreamLayout.fitRect of the available area (what touch mapping assumes). Null = fill.
+     */
     private fun setSurfaceAspect(ratio: String?) {
-        val params = binding.surfaceView.layoutParams as ConstraintLayout.LayoutParams
-        params.dimensionRatio = ratio
-        binding.surfaceView.layoutParams = params
+        for (v in arrayOf(binding.surfaceView, binding.textureView)) {
+            val params = v.layoutParams as ConstraintLayout.LayoutParams
+            if (params.dimensionRatio == ratio) continue
+            params.dimensionRatio = ratio
+            v.layoutParams = params
+        }
     }
 
     /** Plays the bundled recording of a real Mac + phone session, looping, full screen. */
@@ -653,17 +769,66 @@ class MainActivity : AppCompatActivity() {
     private fun updateOverlayVisibility(show: Boolean) {
         if ((streamClient != null || demoActive) && show) {
             binding.statusBar.visibility = View.VISIBLE
-            // Restore position when showing
-            val x = prefs.overlayX
-            val y = prefs.overlayY
-            if (x >= 0 && y >= 0) {
-                binding.statusBar.post {
-                    binding.statusBar.x = x
-                    binding.statusBar.y = y
-                }
-            }
+            // Restore position when showing (docked below the hinge in tabletop)
+            if (posture is Posture.Tabletop) applyPostureControls() else restoreOverlayXY()
         } else {
             binding.statusBar.visibility = View.GONE
+        }
+    }
+
+    /** The user's dragged overlay position, or the layout default when none is saved. */
+    private fun restoreOverlayXY() {
+        val x = prefs.overlayX
+        val y = prefs.overlayY
+        binding.statusBar.post {
+            binding.statusBar.translationX = 0f
+            binding.statusBar.translationY = 0f
+            if (x >= 0 && y >= 0) {
+                binding.statusBar.x = x
+                binding.statusBar.y = y
+            }
+        }
+    }
+
+    /** Orientation and cutout toggles → prefs → re-applied live; geometry changes re-advertise via the watcher. */
+    private fun bindDisplayModeToggles(view: View) {
+        val orientationGroup = view.findViewById<MaterialButtonToggleGroup>(R.id.orientationModeGroup)
+        val cutoutGroup = view.findViewById<MaterialButtonToggleGroup>(R.id.cutoutModeGroup)
+        orientationGroup.check(
+            when (prefs.orientationMode) {
+                OrientationMode.AUTO -> R.id.orientationAuto
+                OrientationMode.PORTRAIT -> R.id.orientationPortrait
+                OrientationMode.LANDSCAPE -> R.id.orientationLandscape
+            },
+        )
+        cutoutGroup.check(if (prefs.cutoutMode == CutoutMode.AVOID) R.id.cutoutAvoid else R.id.cutoutFill)
+
+        orientationGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            val mode =
+                when (checkedId) {
+                    R.id.orientationPortrait -> OrientationMode.PORTRAIT
+                    R.id.orientationLandscape -> OrientationMode.LANDSCAPE
+                    else -> OrientationMode.AUTO
+                }
+            if (mode == prefs.orientationMode) return@addOnButtonCheckedListener
+            prefs.orientationMode = mode
+            applyClientOrientation()
+        }
+        cutoutGroup.addOnButtonCheckedListener { _, checkedId, isChecked ->
+            if (!isChecked) return@addOnButtonCheckedListener
+            val mode = if (checkedId == R.id.cutoutAvoid) CutoutMode.AVOID else CutoutMode.FILL
+            if (mode == prefs.cutoutMode) return@addOnButtonCheckedListener
+            prefs.cutoutMode = mode
+            applyVideoMargins()
+            panelWatcher.notifyInsetsChanged()
+        }
+    }
+
+    /** Applies the user's orientation mode, but only when this phone owns orientation (host matches the panel). */
+    private fun applyClientOrientation() {
+        if (isConnected && streamClient?.streamFormat?.hostMatchesPanel == true) {
+            requestedOrientation = StreamLayout.orientationFor(prefs.orientationMode)
         }
     }
 
@@ -704,6 +869,7 @@ class MainActivity : AppCompatActivity() {
         hideSettingsSwitch.isChecked = prefs.hideSettingsButton
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
+        bindDisplayModeToggles(view)
 
         // Highlight current position selection (8 positions)
         // 0=BottomRight, 1=BottomLeft, 2=TopRight, 3=TopLeft
@@ -724,9 +890,15 @@ class MainActivity : AppCompatActivity() {
                 if (index == selectedPosition) {
                     button.backgroundTintList =
                         android.content.res.ColorStateList
-                            .valueOf(0x334CAF50)
+                            .valueOf(0x3310B981)
+                    button.strokeColor =
+                        android.content.res.ColorStateList
+                            .valueOf(0xFF10B981.toInt())
                 } else {
                     button.backgroundTintList = null
+                    button.strokeColor =
+                        android.content.res.ColorStateList
+                            .valueOf(0x33FFFFFF)
                 }
             }
         }
@@ -841,8 +1013,10 @@ class MainActivity : AppCompatActivity() {
 
         // Cap dialog height to 85% of screen so content scrolls on smaller screens / landscape
         dialog.window?.let { win ->
-            val maxH = (resources.displayMetrics.heightPixels * 0.85).toInt()
-            win.setLayout(WindowManager.LayoutParams.MATCH_PARENT, maxH)
+            val dm = resources.displayMetrics
+            val maxW = minOf((dm.widthPixels * 0.94).toInt(), (520 * dm.density).toInt())
+            val maxH = (dm.heightPixels * 0.88).toInt()
+            win.setLayout(maxW, maxH)
         }
     }
 
@@ -1108,7 +1282,19 @@ class MainActivity : AppCompatActivity() {
             }
 
         if (videoDecoder != null && decoderUsingTextureView == useTextureView) {
-            videoDecoder?.updateResolution(displayWidth, displayHeight)
+            try {
+                videoDecoder?.updateResolution(displayWidth, displayHeight)
+            } catch (e: Exception) {
+                // Every configure rung failed at the new size: drop the decoder instead of crashing.
+                videoDecoder?.release()
+                videoDecoder = null
+                decoderUsingTextureView = false
+                mainDiag("Decoder resize FAILED: ${e.message}")
+                runOnUiThread { updateStatus("Video decoder failed: ${e.message}") }
+                return
+            }
+            resetLatencyStats()
+            if (!demoActive) applyStreamPresentation()
             return
         }
 
@@ -1121,26 +1307,33 @@ class MainActivity : AppCompatActivity() {
                 "res=${displayWidth}x$displayHeight, texture=$useTextureView",
         )
         try {
-            val displayObj =
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    display
-                } else {
-                    @Suppress("DEPRECATION")
-                    windowManager.defaultDisplay
-                }
+            val displayObj = display
             val mime =
                 if (demoActive || streamClient?.streamCodecIsHevc == false) {
                     MediaFormat.MIMETYPE_VIDEO_AVC
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
                 }
-            videoDecoder = VideoDecoder(surface, displayObj, displayWidth, displayHeight, mime)
-            videoDecoder?.onFrameDecoded = { buffer ->
+            val format = if (demoActive) null else streamClient?.streamFormat
+            val dec =
+                VideoDecoder(
+                    surface,
+                    displayObj,
+                    displayWidth,
+                    displayHeight,
+                    mime,
+                    streamFormat = format,
+                    targetFps = format?.fps?.takeIf { it > 0 } ?: DEFAULT_TARGET_FPS,
+                )
+            videoDecoder = dec
+            dec.onFrameDecoded = { buffer ->
                 streamClient?.releaseBuffer(buffer)
             }
-            videoDecoder?.onKeyframeRequired = { force, reason ->
+            dec.onKeyframeRequired = { force, reason ->
                 streamClient?.requestKeyframe(force = force, reason = reason)
             }
+            dec.onFrameOutput = { ptsUs, nowNs -> onFrameOutput(ptsUs, nowNs) }
+            dec.onFrameRendered = { ptsUs, renderNs -> onFrameRendered(ptsUs, renderNs) }
             videoDecoder?.onDecoderStalled = {
                 // Black screen with live stats: tell the user why instead of
                 // staying silent (issue #41). Toast renders above the (black)
@@ -1169,8 +1362,9 @@ class MainActivity : AppCompatActivity() {
                         ).show()
                 }
             }
+            resetLatencyStats()
             streamClient?.requestKeyframe(force = true, reason = "decoder initialized")
-            mainDiag("Decoder initialized OK ${displayWidth}x$displayHeight mime=$mime, texture=$useTextureView")
+            if (!demoActive) applyStreamPresentation()
             log("✅ Decoder initialized ${displayWidth}x$displayHeight $mime (${displayObj?.refreshRate ?: 60f}Hz)")
         } catch (e: Exception) {
             decoderUsingTextureView = false
@@ -1186,12 +1380,24 @@ class MainActivity : AppCompatActivity() {
      * Wire up all StreamClient callbacks. Used by both USB connect() and wireless connectWireless().
      */
     private fun setupStreamClientCallbacks() {
-        streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
+        val client = streamClient ?: return
+        client.capabilitiesProvider = { latestCapabilities }
+
+        client.onFrameReceived = { frameData, frameSize, recvNs, isKeyframe, hostCaptureNs ->
             val dec = videoDecoder
             if (dec != null) {
-                dec.decode(frameData, frameSize, timestamp, isKeyframe)
+                val prevRecvNs = lastFrameRecvNs
+                lastFrameRecvNs = recvNs
+                // Exclude isolated idle keepalive frames (>250 ms gap) from active latency stats:
+                // waking the VPU from power collapse and an LTPO panel from idle refresh is not
+                // representative of active streaming latency.
+                val isIdleKeepalive = prevRecvNs > 0L && (recvNs - prevRecvNs) > IDLE_FRAME_GAP_NS
+                if (!isIdleKeepalive) {
+                    frameTimeline.record(recvNs / 1000, recvNs, hostCaptureNs)
+                }
+                dec.decode(frameData, frameSize, recvNs, isKeyframe)
             } else {
-                mainDiag("FRAME DROPPED: videoDecoder is null!")
+                client.releaseBuffer(frameData)
             }
         }
 
@@ -1199,13 +1405,11 @@ class MainActivity : AppCompatActivity() {
             streamClient?.releaseBuffer(buffer)
         }
 
-        streamClient?.onLatencyMeasured = { rttMs ->
-            runOnUiThread {
-                binding.latencyText.text = String.format("%.1f ms", rttMs)
-            }
-        }
+        client.onLatencyMeasured = { rttMs -> pingRttMs = rttMs }
 
-        streamClient?.onConnectionStatus = { connected ->
+        client.onStreamFormat = { format -> runOnUiThread { onStreamFormatChanged(format) } }
+
+        client.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
                 if (connected) {
@@ -1216,16 +1420,20 @@ class MainActivity : AppCompatActivity() {
                 binding.connectButton.isEnabled = !connected
                 binding.disconnectButton.isEnabled = connected
                 binding.statusIndicator.setBackgroundResource(
-                    if (connected) android.R.color.holo_green_light else android.R.color.holo_red_light,
+                    if (connected) R.drawable.status_indicator_green else R.drawable.status_indicator_red,
                 )
                 if (connected) {
                     startPingTimer()
+                    startLatencyOverlay()
+                    applyStreamPresentation()
                     stopChecklistUpdates()
                     enableFullscreenMode()
                     binding.settingsPanel.visibility = View.GONE
                     applySettingsButtonVisibility()
                     restoreSettingsButtonPosition()
                     updateOverlayVisibility(prefs.showStatsOverlay)
+                    applyVideoMargins()
+                    applyPostureControls()
                     // For wireless mode, transition controller to CONNECTED here —
                     // not in MainActivity.connectWireless's coroutine after the
                     // receive loop returns (that runs AFTER disconnect, causing
@@ -1238,7 +1446,12 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
                 } else {
+                    streamClient = null
                     stopPingTimer()
+                    stopLatencyOverlay()
+                    stopSessionObservers()
+                    resetStreamPresentation()
+                    setSurfaceAspect(null)
                     disableFullscreenMode()
                     resetOrientationToSensor()
                     binding.settingsPanel.visibility = View.VISIBLE
@@ -1262,15 +1475,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        streamClient?.onDesktopSize = { w, h ->
+        client.onDesktopSize = { w, h ->
             desktopWidth = w
             desktopHeight = h
             runOnUiThread { updateResolutionOverlay() }
         }
 
-        streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
+        client.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
-        streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
+        client.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
             mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
             warnIfAvcOnlyWithoutNegotiation()
             displayWidth = width
@@ -1280,17 +1493,227 @@ class MainActivity : AppCompatActivity() {
             displayFlipVertical = flipVertical
             runOnUiThread {
                 updateResolutionOverlay()
+                setSurfaceAspect("$width:$height")
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
             }
             log("Display: ${width}x$height @ $rotation°")
         }
 
-        streamClient?.onStats = { fps, mbps ->
+        client.onStats = { fps, mbps ->
             runOnUiThread {
                 binding.fpsText.text = String.format("%.1f", fps)
                 binding.bitrateText.text = String.format("%.1f Mbps", mbps)
             }
+        }
+    }
+
+    /**
+     * Type 16 (main thread). With a panel-matching host this phone owns orientation, so the user's
+     * mode applies and the type-1 rotation is ignored from here on (see applyRotation).
+     */
+    private fun onStreamFormatChanged(format: StreamFormat) {
+        if (streamClient == null) return
+        if (format.hostMatchesPanel) {
+            requestedOrientation = StreamLayout.orientationFor(prefs.orientationMode)
+        }
+        videoDecoder?.updateStreamFormat(format)
+        applyStreamPresentation()
+    }
+
+    /** Window colour mode and refresh-rate pin for the current stream (main thread, live session only). */
+    private fun applyStreamPresentation() {
+        if (!isConnected) return
+        val format = streamClient?.streamFormat
+        val hdr = format?.isHdr == true && videoDecoder?.isHdrConfigured == true
+        val colorMode = if (hdr) ActivityInfo.COLOR_MODE_HDR else ActivityInfo.COLOR_MODE_DEFAULT
+        if (window.colorMode != colorMode) {
+            window.colorMode = colorMode
+            mainDiag("Window colour mode ${if (hdr) "HDR" else "default"}")
+        }
+        pinRefreshRate(format?.fps?.takeIf { it > 0 })
+    }
+
+    /**
+     * Pins the panel's fastest mode at its current resolution (an LTPO panel would otherwise idle
+     * down and add a frame of latency) and tells the compositor the video's real cadence.
+     * Mode sizes are compared orientation-independently: some panels list modes in their native
+     * portrait size while the device is used in landscape.
+     * `preferredMinDisplayRefreshRate` is not public SDK API (@hide in android-36), so the mode id
+     * plus `preferredRefreshRate` carry the request.
+     */
+    private fun pinRefreshRate(streamFps: Int?) {
+        val d = display ?: return
+        val current = d.mode
+        val longSide = maxOf(current.physicalWidth, current.physicalHeight)
+        val shortSide = minOf(current.physicalWidth, current.physicalHeight)
+        val best =
+            d.supportedModes
+                .filter {
+                    maxOf(it.physicalWidth, it.physicalHeight) == longSide &&
+                        minOf(it.physicalWidth, it.physicalHeight) == shortSide
+                }.maxByOrNull { it.refreshRate } ?: current
+        val attrs = window.attributes
+        if (attrs.preferredDisplayModeId != best.modeId || attrs.preferredRefreshRate != best.refreshRate) {
+            attrs.preferredDisplayModeId = best.modeId
+            attrs.preferredRefreshRate = best.refreshRate
+            attrs.preferMinimalPostProcessing = true
+            window.attributes = attrs
+            val size = "${best.physicalWidth}x${best.physicalHeight}"
+            mainDiag("Pinned display mode ${best.modeId} ($size@${best.refreshRate})")
+        }
+        // Always vote the panel's peak refresh rate on the video Surface so LTPO panels
+        // never throttle down to 60 Hz (adding +8.33 ms VSYNC latency) on 60 fps or idle content.
+        val fps = maxOf(streamFps?.toFloat() ?: 0f, best.refreshRate)
+        setVideoSurfaceFrameRate(fps)
+    }
+
+    private fun setVideoSurfaceFrameRate(fps: Float) {
+        val surface = activeVideoSurface()?.first ?: return
+        try {
+            if (fps > 0f) {
+                surface.setFrameRate(
+                    fps,
+                    Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    Surface.CHANGE_FRAME_RATE_ONLY_IF_SEAMLESS,
+                )
+            } else {
+                surface.setFrameRate(0f, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            }
+        } catch (e: Exception) {
+            mainDiag("setFrameRate($fps) failed: ${e.message}")
+        }
+    }
+
+    /** Back to the system's colour mode and refresh-rate policy once no session is shown. */
+    private fun resetStreamPresentation() {
+        window.colorMode = ActivityInfo.COLOR_MODE_DEFAULT
+        val attrs = window.attributes
+        if (attrs.preferredDisplayModeId != 0 || attrs.preferredRefreshRate != 0f) {
+            attrs.preferredDisplayModeId = 0
+            attrs.preferredRefreshRate = 0f
+            attrs.preferMinimalPostProcessing = false
+            window.attributes = attrs
+        }
+        setVideoSurfaceFrameRate(0f)
+    }
+
+    // ==================== Latency overlay ====================
+
+    /** Host capture instant of the frame with this PTS in the local clock, or null when unknown. */
+    private fun captureClientNs(ptsUs: Long): Long? {
+        val hostNs = frameTimeline.hostCaptureNs(ptsUs)
+        if (hostNs <= 0L) return null
+        val clock = streamClient?.clockSync ?: return null
+        if (!clock.isConfident) return null
+        return clock.hostToClientNs(hostNs)
+    }
+
+    /** Decoder thread. */
+    private fun onFrameOutput(
+        ptsUs: Long,
+        nowNs: Long,
+    ) {
+        val recvNs = frameTimeline.recvNs(ptsUs)
+        if (recvNs != FrameTimeline.MISSING) addLatencySample(decodeStats, nowNs - recvNs)
+        captureClientNs(ptsUs)?.let { addLatencySample(e2eDecodedStats, nowNs - it) }
+    }
+
+    /** Decoder thread. */
+    private fun onFrameRendered(
+        ptsUs: Long,
+        renderNs: Long,
+    ) {
+        captureClientNs(ptsUs)?.let { addLatencySample(e2eRenderedStats, renderNs - it) }
+    }
+
+    /** Negative or absurd values mean a clock estimate that is still settling; they are not latency. */
+    private fun addLatencySample(
+        stats: LatencyStats,
+        ns: Long,
+    ) {
+        if (ns in 0..MAX_PLAUSIBLE_LATENCY_NS) stats.add(ns)
+    }
+
+    private fun resetLatencyStats() {
+        frameTimeline.clear()
+        e2eRenderedStats.clear()
+        e2eDecodedStats.clear()
+        decodeStats.clear()
+        lastFrameRecvNs = 0L
+        lastRenderedTotal = 0L
+        lastDecodedTotal = 0L
+    }
+
+    private fun startLatencyOverlay() {
+        resetLatencyStats()
+        pingRttMs = -1.0
+        overlayLogTicks = 0
+        binding.latencyLabel.text = "LATENCY"
+        binding.latencyText.text = "--"
+        latencyHandler.removeCallbacks(latencyOverlayRunnable)
+        latencyHandler.postDelayed(latencyOverlayRunnable, LATENCY_OVERLAY_INTERVAL_MS)
+    }
+
+    private fun stopLatencyOverlay() {
+        latencyHandler.removeCallbacks(latencyOverlayRunnable)
+    }
+
+    /**
+     * "E2E p50/p95 · dec · rtt". Primary E2E is host capture → decoded (true streaming pipeline
+     * completion before SurfaceFlinger's asynchronous future VSYNC scanout wait), while
+     * capture → render (HWC present fence) is tracked in [e2eRenderedStats] for diagnostics.
+     */
+    @SuppressLint("SetTextI18n")
+    private fun updateLatencyOverlay() {
+        val clock = streamClient?.clockSync
+        val rttMs = clock?.minRttNs?.let { it / 1e6 } ?: pingRttMs.takeIf { it >= 0 }
+        val rttText = rttMs?.let { String.format("rtt %.1f", it) } ?: "rtt --"
+        val decText = decodeStats.p50()?.let { String.format("dec %.1f", it / 1e6) } ?: "dec --"
+
+        val renderedTotal = e2eRenderedStats.total
+        val decodedTotal = e2eDecodedStats.total
+        val renderedLive = renderedTotal > lastRenderedTotal
+        val decodedLive = decodedTotal > lastDecodedTotal
+        lastRenderedTotal = renderedTotal
+        lastDecodedTotal = decodedTotal
+
+        val (stats, endpoint) =
+            when {
+                decodedTotal > 0 && (decodedLive || !renderedLive) -> e2eDecodedStats to "capture→decode"
+                renderedTotal > 0 -> e2eRenderedStats to "capture→render"
+                else -> null to null
+            }
+        val p50 = stats?.p50()
+        val p95 = stats?.p95()
+        if (stats != null && p50 != null && p95 != null) {
+            binding.latencyLabel.text = "E2E $endpoint (ms)"
+            binding.latencyText.text =
+                String.format("E2E %.1f/%.1f · %s · %s", p50 / 1e6, p95 / 1e6, decText, rttText)
+            overlayLogTicks++
+            if (overlayLogTicks % 4 == 0) {
+                val decP50 = e2eDecodedStats.p50()?.let { it / 1e6 } ?: -1.0
+                val decP95 = e2eDecodedStats.p95()?.let { it / 1e6 } ?: -1.0
+                val renP50 = e2eRenderedStats.p50()?.let { it / 1e6 } ?: -1.0
+                val renP95 = e2eRenderedStats.p95()?.let { it / 1e6 } ?: -1.0
+                mainDiag(
+                    String.format(
+                        "Latency summary: capture→decode=%.1f/%.1fms, capture→render=%.1f/%.1fms, %s, %s",
+                        decP50,
+                        decP95,
+                        renP50,
+                        renP95,
+                        decText,
+                        rttText,
+                    ),
+                )
+            }
+        } else if (streamClient?.streamFormat?.hostSupportsClockSync == true) {
+            binding.latencyLabel.text = "E2E (ms, clock syncing…)"
+            binding.latencyText.text = "$decText · $rttText"
+        } else {
+            binding.latencyLabel.text = "RTT (ms, host has no clock sync)"
+            binding.latencyText.text = "$rttText · $decText"
         }
     }
 
@@ -1414,23 +1837,28 @@ class MainActivity : AppCompatActivity() {
         macName: String,
     ) {
         stopDemo() // a real connection (incl. wireless auto-reconnect) takes over the decoder
+        stopChecklistUpdates()
+        isConnected = true
+        startSessionObservers()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
                 streamClient = StreamClient(host, port, applicationContext)
                 setupStreamClientCallbacks()
                 streamClient?.connectWireless(token, deviceName)
-                // NOTE: onConnectSuccess is fired from the onConnectionStatus(true)
-                // listener (above) right after handshake OK — not here. This line
-                // would otherwise run AFTER the receive loop exits, i.e. AFTER
-                // disconnect, incorrectly transitioning back to CONNECTED.
             } catch (e: StreamClient.WirelessConnectError) {
+                isConnected = false
+                streamClient = null
                 runOnUiThread {
+                    stopSessionObservers()
                     wirelessController.onConnectError(e)
                 }
             } catch (e: Exception) {
+                isConnected = false
+                streamClient = null
                 log("Wireless connect failed: ${e.message}")
                 runOnUiThread {
+                    stopSessionObservers()
                     wirelessController.onConnectError(StreamClient.WirelessConnectError.NetworkUnreachable)
                 }
             }
@@ -1442,128 +1870,19 @@ class MainActivity : AppCompatActivity() {
         port: Int,
     ) {
         stopDemo()
+        stopChecklistUpdates()
+        isConnected = true
+        startSessionObservers()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
-
                 streamClient = StreamClient(host, port, applicationContext)
-                streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
-                    val dec = videoDecoder
-                    if (dec != null) {
-                        dec.decode(frameData, frameSize, timestamp, isKeyframe)
-                    } else {
-                        streamClient?.releaseBuffer(frameData)
-                    }
-                }
-
-                // Wire up buffer release callback for buffer pooling
-                // When decode completes, buffer is returned to StreamClient's pool
-                videoDecoder?.onFrameDecoded = { buffer ->
-                    streamClient?.releaseBuffer(buffer)
-                }
-                videoDecoder?.onKeyframeRequired = { force, reason ->
-                    streamClient?.requestKeyframe(force = force, reason = reason)
-                }
-
-                // Latency measurement via ping/pong
-                streamClient?.onLatencyMeasured = { rttMs ->
-                    runOnUiThread {
-                        binding.latencyText.text = String.format("%.1f ms", rttMs)
-                    }
-                }
-
-                streamClient?.onConnectionStatus = { connected ->
-                    runOnUiThread {
-                        // Update connection state flag
-                        isConnected = connected
-
-                        if (connected) {
-                            updateStatus("Connected - Streaming active")
-                        } else {
-                            updateStatus("Disconnected")
-                        }
-
-                        binding.connectButton.isEnabled = !connected
-                        binding.disconnectButton.isEnabled = connected
-
-                        // Update status indicator color
-                        binding.statusIndicator.setBackgroundResource(
-                            if (connected) {
-                                android.R.color.holo_green_light
-                            } else {
-                                android.R.color.holo_red_light
-                            },
-                        )
-
-                        if (connected) {
-                            // Start periodic ping for latency measurement
-                            startPingTimer()
-
-                            // Stop checklist updates when connected (prevents socket conflicts)
-                            stopChecklistUpdates()
-
-                            // Enter fullscreen mode when connected
-                            enableFullscreenMode()
-
-                            binding.settingsPanel.visibility = View.GONE
-                            applySettingsButtonVisibility()
-                            restoreSettingsButtonPosition()
-                            updateOverlayVisibility(prefs.showStatsOverlay)
-                        } else {
-                            // Stop ping timer
-                            stopPingTimer()
-
-                            // Exit fullscreen mode when disconnected
-                            disableFullscreenMode()
-
-                            // Reset to follow device sensor when disconnected
-                            resetOrientationToSensor()
-
-                            binding.settingsPanel.visibility = View.VISIBLE
-                            binding.settingsButton.visibility = View.GONE
-                            binding.statusBar.visibility = View.GONE
-
-                            // Restart checklist updates immediately
-                            log("📋 Restarting checklist updates")
-                            startChecklistUpdates()
-                        }
-                    }
-                }
-
-                streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
-
-                streamClient?.onDesktopSize = { w, h ->
-                    desktopWidth = w
-                    desktopHeight = h
-                    runOnUiThread { updateResolutionOverlay() }
-                }
-
-                streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
-                    mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
-                    warnIfAvcOnlyWithoutNegotiation()
-                    displayWidth = width
-                    displayHeight = height
-                    displayRotation = rotation
-                    displayFlipHorizontal = flipHorizontal
-                    displayFlipVertical = flipVertical
-
-                    runOnUiThread {
-                        updateResolutionOverlay()
-                        applyRotation(rotation, flipHorizontal, flipVertical)
-                        initializeDecoderForCurrentSurface()
-                    }
-                    log("Display: ${width}x$height @ $rotation°")
-                }
-
-                streamClient?.onStats = { fps, mbps ->
-                    runOnUiThread {
-                        binding.fpsText.text = String.format("%.1f", fps)
-                        binding.bitrateText.text = String.format("%.1f Mbps", mbps)
-                    }
-                }
-
+                setupStreamClientCallbacks()
                 streamClient?.connect()
             } catch (e: Exception) {
+                isConnected = false
+                streamClient = null
+                startChecklistUpdates()
                 val errorMessage =
                     when {
                         e.message?.contains("ECONNREFUSED") == true -> {
@@ -1585,6 +1904,7 @@ class MainActivity : AppCompatActivity() {
                                 "• Check USB connection\n• Run: adb reverse tcp:$port tcp:$port"
                         }
                     }
+                runOnUiThread { stopSessionObservers() }
                 updateStatus("Connection failed")
                 showError(errorMessage)
             }
@@ -1593,8 +1913,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun disconnect() {
         stopPingTimer()
+        stopLatencyOverlay()
+        stopSessionObservers()
+        isConnected = false
         streamClient?.disconnect()
-        // Reset display config so next connect defers decoder init until config arrives
+        streamClient = null
+        if (prefs.connectionMode == ConnectionMode.USB) {
+            startChecklistUpdates()
+        }
         displayWidth = 0
         displayHeight = 0
         desktopWidth = 0
@@ -1648,88 +1974,122 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Touch → host, in 0..1 coordinates of the picture: mapped through [StreamLayout.fitRect] so a
+     * letterboxed picture (a rotation re-mode in flight, tabletop, an old host's fixed size) maps
+     * correctly. A gesture that starts outside the picture is not sent at all; moves outside it are
+     * dropped; releases and the second finger are pinned to the edge so the host never sees a
+     * press without its release.
+     */
     private fun handleTouch(
         view: View,
         event: MotionEvent,
     ) {
-        val rawX = event.x / view.width.toFloat()
-        val rawY = event.y / view.height.toFloat()
-        val x = if (displayFlipHorizontal) 1f - rawX else rawX
-        val y = if (displayFlipVertical) 1f - rawY else rawY
+        val rect = StreamLayout.fitRect(view.width.toFloat(), view.height.toFloat(), displayWidth, displayHeight)
+        val action = event.actionMasked
+        if (action == MotionEvent.ACTION_DOWN) {
+            touchGestureActive = StreamLayout.normalizeTouch(event.x, event.y, rect) != null
+            if (touchGestureActive) inputPredictor.reset()
+        }
+        if (!touchGestureActive) return
+        val client = streamClient ?: return
         val pointerCount = event.pointerCount.coerceAtMost(2)
 
         var x2 = 0f
         var y2 = 0f
         if (pointerCount >= 2) {
-            val rawX2 = event.getX(1) / view.width.toFloat()
-            val rawY2 = event.getY(1) / view.height.toFloat()
-            x2 = if (displayFlipHorizontal) 1f - rawX2 else rawX2
-            y2 = if (displayFlipVertical) 1f - rawY2 else rawY2
+            val (nx2, ny2) = StreamLayout.clampTouch(event.getX(1), event.getY(1), rect)
+            x2 = flipX(nx2)
+            y2 = flipY(ny2)
         }
 
-        when (event.actionMasked) {
+        when (action) {
             MotionEvent.ACTION_DOWN -> {
-                inputPredictor.reset()
-                inputPredictor.addSample(x, y)
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                val (x, y) = StreamLayout.clampTouch(event.x, event.y, rect)
+                inputPredictor.addSample(flipX(x), flipY(y), event.eventTime * NANOS_PER_MILLI)
+                client.sendTouch(flipX(x), flipY(y), 0, pointerCount, x2, y2)
             }
 
             MotionEvent.ACTION_POINTER_DOWN -> {
-                streamClient?.sendTouch(x, y, 0, pointerCount, x2, y2)
+                val (x, y) = StreamLayout.clampTouch(event.x, event.y, rect)
+                client.sendTouch(flipX(x), flipY(y), 0, pointerCount, x2, y2)
             }
 
             MotionEvent.ACTION_MOVE -> {
+                val (x, y) = StreamLayout.normalizeTouch(event.x, event.y, rect) ?: return
                 if (pointerCount == 1) {
-                    inputPredictor.addSample(x, y)
-                    val (px, py) = inputPredictor.predictPosition(12f)
-                    streamClient?.sendTouch(px, py, 1, 1)
+                    // Batched samples since the last frame sharpen the velocity fit.
+                    for (i in 0 until event.historySize) {
+                        val (hx, hy) =
+                            StreamLayout.normalizeTouch(event.getHistoricalX(i), event.getHistoricalY(i), rect)
+                                ?: continue
+                        val timeNs = event.getHistoricalEventTime(i) * NANOS_PER_MILLI
+                        inputPredictor.addSample(flipX(hx), flipY(hy), timeNs)
+                    }
+                    inputPredictor.addSample(flipX(x), flipY(y), event.eventTime * NANOS_PER_MILLI)
+                    inputPredictor.predict(predictionLeadMs())
+                    client.sendTouch(inputPredictor.predictedX, inputPredictor.predictedY, 1, 1)
                 } else {
-                    streamClient?.sendTouch(x, y, 1, pointerCount, x2, y2)
+                    client.sendTouch(flipX(x), flipY(y), 1, pointerCount, x2, y2)
                 }
             }
 
-            MotionEvent.ACTION_UP -> {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                touchGestureActive = false
+                val (x, y) = StreamLayout.clampTouch(event.x, event.y, rect)
+                client.sendTouch(flipX(x), flipY(y), 2, 1)
             }
 
             MotionEvent.ACTION_POINTER_UP -> {
-                streamClient?.sendTouch(x, y, 2, pointerCount, x2, y2)
-            }
-
-            MotionEvent.ACTION_CANCEL -> {
-                inputPredictor.reset()
-                streamClient?.sendTouch(x, y, 2, 1)
+                val (x, y) = StreamLayout.clampTouch(event.x, event.y, rect)
+                client.sendTouch(flipX(x), flipY(y), 2, pointerCount, x2, y2)
             }
         }
     }
 
+    private fun flipX(x: Float) = if (displayFlipHorizontal) 1f - x else x
+
+    private fun flipY(y: Float) = if (displayFlipVertical) 1f - y else y
+
+    /** Prediction lead from the best RTT known: clock-sync minimum, else the ping round trip. */
+    private fun predictionLeadMs(): Float {
+        val rttMs = streamClient?.clockSync?.minRttNs?.let { it / 1e6 } ?: pingRttMs.takeIf { it >= 0 }
+        return InputPredictor.leadMsFor(rttMs)
+    }
+
+    /**
+     * Flips and the TextureView switch always apply. Orientation is set here only for a host that
+     * rotates its own desktop (old host, or "match device" off); a panel-matching host leaves it
+     * to the user's orientation mode (onStreamFormatChanged), so exactly one side decides.
+     */
     private fun applyRotation(
         rotation: Int,
         flipHorizontal: Boolean,
         flipVertical: Boolean,
     ) {
-        requestedOrientation =
-            when (rotation) {
-                90 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
-                180 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE
-                270 -> ActivityInfo.SCREEN_ORIENTATION_REVERSE_PORTRAIT
-                else -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
-            }
+        val hostMatchesPanel = streamClient?.streamFormat?.hostMatchesPanel == true
+        if (!hostMatchesPanel) {
+            requestedOrientation = StreamLayout.legacyOrientationFor(displayWidth, displayHeight, rotation)
+        }
 
         binding.surfaceView.rotation = 0f
         binding.surfaceView.visibility = View.VISIBLE
         binding.textureView.visibility = if (flipHorizontal || flipVertical) View.VISIBLE else View.GONE
         applyTextureTransform()
 
-        log(
-            "🔄 Orientation: ${when (rotation) {
-                90 -> "Portrait"
-                180 -> "Landscape (flipped)"
-                270 -> "Portrait (flipped)"
-                else -> "Landscape"
-            }}${if (flipHorizontal || flipVertical) " mirrored" else ""}",
-        )
+        val orientation =
+            if (hostMatchesPanel) {
+                "follows phone (${prefs.orientationMode.name.lowercase()})"
+            } else {
+                when (rotation) {
+                    90 -> "Portrait"
+                    180 -> "Landscape (flipped)"
+                    270 -> "Portrait (flipped)"
+                    else -> "Landscape"
+                }
+            }
+        log("🔄 Orientation: $orientation${if (flipHorizontal || flipVertical) " mirrored" else ""}")
     }
 
     private fun applyTextureTransform() {
@@ -1764,11 +2124,22 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         // Only nudge about updates while idle — never over a live stream or the demo.
-        if (!isStreamingUi) appUpdater.checkForUpdate()
+        if (!isStreamingUi) {
+            appUpdater.checkForUpdate()
+            if (prefs.connectionMode == ConnectionMode.USB) {
+                startChecklistUpdates()
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (!isConnected) {
+            stopChecklistUpdates()
+        }
     }
 
     override fun onDestroy() {
-        super.onDestroy()
         stopChecklistUpdates()
         cleanup()
     }
@@ -1799,8 +2170,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateChecklist() {
-        // Skip if connected (to prevent socket conflicts)
-        if (isConnected) return
+        // Skip if connecting or connected (to prevent socket conflicts and stream disruption)
+        if (isConnected || streamClient != null) return
 
         // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
         val isDeveloperModeEnabled =
@@ -1894,6 +2265,7 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ): Boolean {
+        if (isConnected || streamClient != null) return true
         var socket: Socket? = null
         return try {
             socket = Socket()
@@ -1918,5 +2290,22 @@ class MainActivity : AppCompatActivity() {
                 // ignore
             }
         }
+    }
+
+    private companion object {
+        const val LATENCY_OVERLAY_INTERVAL_MS = 500L
+
+        /** Beyond this a "latency" is a clock estimate still settling, not a frame that took that long. */
+        const val MAX_PLAUSIBLE_LATENCY_NS = 2_000_000_000L
+
+        /** Frames arriving after >250 ms silence are idle keepalives, excluded from active E2E stats. */
+        const val IDLE_FRAME_GAP_NS = 250_000_000L
+
+        /** Decoder frame-rate hint when the host does not announce its fps (old host, demo). */
+        const val DEFAULT_TARGET_FPS = 60
+        const val NANOS_PER_MILLI = 1_000_000L
+
+        /** updateSettingsButtonPosition index: bottom centre, the lower half in tabletop posture. */
+        const val SETTINGS_POSITION_BOTTOM_CENTER = 5
     }
 }

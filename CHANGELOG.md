@@ -11,12 +11,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Android: mandatory in-app updates — a build installed from Google Play checks for a newer version whenever it is idle (never during a stream or the demo) and, if there is one, Play's full-screen update installs it and restarts the app; backing out closes the app.
+- HDR10: HEVC Main10 streaming with an Auto / On / Off setting on the Mac. HDR capture needs macOS 26+ (built with Swift 6.2+); on older systems, or when the phone can't decode Main10, the stream falls back to SDR. The Mac's Settings shows the negotiated "Stream format" (e.g. HDR10 · 10-bit · 120 fps · 2340×1080).
+- Match device display (default on): the Mac's virtual display follows the phone's current orientation and size, and is re-moded in place on rotation or fold/unfold without dropping the connection. Resolution and rotation settings are disabled while it is on. Old Android clients that don't advertise their panel keep the host-side rotation setting. If an in-place re-mode fails, the display is recreated.
+- Mac: "4:3 Foldables" resolution group (1224×924, 1632×1232, 2448×1848).
+- Android: latency overlay showing E2E p50/p95 · decode · RTT, using a clock offset estimated against the Mac. E2E is capture→render, or capture→decode when no render reports arrive (the label says which). Hosts without clock sync show RTT and decode only.
+- Android: Orientation (Auto / Portrait / Landscape) and Camera cutout (Fill to edges / Avoid) settings. With Match device, the chosen orientation is advertised to the Mac.
+- Android: foldable tabletop layout — in tabletop posture the video sits above the hinge and the settings button and stats overlay move below it.
+- Android: the display is pinned to its highest refresh mode at the current resolution (120 Hz where available), with the surface frame rate set to the stream's fps.
+- Wire protocol (contributors): new message types 15 (client capabilities: panel size, refresh, HDR/Main10 flags, peak nits), 16 (stream format: bit depth, HDR, fps, flags incl. host-matches-panel), 17/18 (clock-sync request/response); type 6 frames carry a capture timestamp. Hosts and clients that don't send type 15 get the previous type-0 frames unchanged. See `StreamWire.swift` / `StreamWire.kt`.
 
 ### Changed
 - Android: release builds are now shrunk and obfuscated with R8 (Play's DEX-optimization requirement; also cuts the install size). Crash traces stay readable via the mapping embedded in the bundle.
+- Defaults for new installs: 120 Hz, 80 Mbps, HiDPI on. Gaming Boost now uses 150 Mbps (was 1 Gbps). The bitrate slider runs 20–500 Mbps with presets 50/80/100/150/300; saved values above 500 are kept but the slider shows 500. Existing users keep their saved values.
+- Android: minimum version is now Android 13 (minSdk 33, was Android 8).
+- Android: decoder selection prefers low-latency; Qualcomm (`c2.qti.`/`omx.qcom.`) decoders get the vendor low-latency keys (Exynos has its own key). The newest decoded frame is rendered and older ones are released unrendered, replacing the fixed 100 ms stale-frame drop.
+- Mac: capture and encode run on one serial queue with inline encoding, queue depth 3, and a single copy per frame. Frames are sent from the encoder thread, and encoding is skipped while the connection is backed up (≥2 frames or >1.5 MB in flight). The IDR interval is 60 s; keyframes are sent on request.
+- Android: touch prediction rewritten — least-squares velocity over the last 50 ms using batched touch samples, lead of min(8 ms, RTT/2 + 2 ms), clamped to the screen. The Mac's minimum touch interval is 3 ms.
 
 ### Fixed
 - Android: starting the demo while a connection attempt was still in progress left that attempt running in the background; it is now cancelled first.
+- Android: a video frame that arrived while no decoder existed was never released; it is now.
+- Android: touches are mapped onto the picture itself (the video is letterboxed to the stream's aspect). A gesture that starts outside the picture is ignored, moves outside it are dropped, and releases and the second finger are clamped to the edge so the Mac never misses a release.
 - Blurry picture on tablets whose stream was shrunk well below the panel (#78). The tablet now reports the size its decoder sustains at 30, 60 and 120 fps separately (new wire type 14, alongside the old single figure), and the Mac uses the entry for the rate it streams at instead of scaling the 60 fps figure — which on a 2800×1840 MatePad Air at 120 Hz turned the full panel into 1968×1280. Tablets whose H.264 decoder sustains a noticeably larger picture than their HEVC one (Honor Pad X9 and similar budget chips) now ask for H.264 at the larger size. Both apps need updating for the full effect; either side alone keeps the old behaviour.
 
 ### Changed

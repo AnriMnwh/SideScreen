@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Mac Monitor Frame (Left) -->
+    <path
+        android:pathData="M 28,34 L 62,34 A 4,4 0 0 1 66,38 L 66,66 A 4,4 0 0 1 62,70 L 28,70 A 4,4 0 0 1 24,66 L 24,38 A 4,4 0 0 1 28,34 Z"
+        android:fillColor="#FF334155" />
+
+    <!-- Mac Monitor Screen (Dark Inset) -->
+    <path
+        android:pathData="M 29,37 L 61,37 A 2,2 0 0 1 63,39 L 63,65 A 2,2 0 0 1 61,67 L 29,67 A 2,2 0 0 1 27,65 L 27,39 A 2,2 0 0 1 29,37 Z"
+        android:fillColor="#FF0F172A" />
+
+    <!-- Mac Stand -->
+    <path
+        android:pathData="M 43,70 L 47,70 L 47,77 L 43,77 Z"
+        android:fillColor="#FF334155" />
+    <path
+        android:pathData="M 38,77 L 52,77 A 1.5,1.5 0 0 1 53.5,78.5 L 53.5,79 L 36.5,79 L 36.5,78.5 A 1.5,1.5 0 0 1 38,77 Z"
+        android:fillColor="#FF475569" />
+
+    <!-- Companion Tablet Frame (Right Overlapping Foreground) -->
+    <path
+        android:pathData="M 52,30 L 80,30 A 4,4 0 0 1 84,34 L 84,74 A 4,4 0 0 1 80,78 L 52,78 A 4,4 0 0 1 48,74 L 48,34 A 4,4 0 0 1 52,30 Z"
+        android:fillColor="#FF1E293B" />
+
+    <!-- Tablet Screen (Vibrant HDR Gradient) -->
+    <path
+        android:pathData="M 53,32 L 79,32 A 2.5,2.5 0 0 1 81.5,34.5 L 81.5,73.5 A 2.5,2.5 0 0 1 79,76 L 53,76 A 2.5,2.5 0 0 1 50.5,73.5 L 50.5,34.5 A 2.5,2.5 0 0 1 53,32 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="50"
+                android:startY="32"
+                android:endX="82"
+                android:endY="76">
+                <item android:offset="0.0" android:color="#FF38BDF8" />
+                <item android:offset="1.0" android:color="#FF34D399" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Low-latency Pulse Wave Signal -->
+    <path
+        android:pathData="M 54,54 L 59,54 L 62,47 L 66,61 L 70,50 L 73,54 L 78,54"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.8"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+</vector>

@@ -4,12 +4,12 @@
     xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="wrap_content"
-    android:layout_marginStart="24dp"
-    android:layout_marginEnd="24dp"
-    android:layout_marginTop="40dp"
-    android:layout_marginBottom="40dp"
+    android:layout_marginStart="20dp"
+    android:layout_marginEnd="20dp"
+    android:layout_marginTop="24dp"
+    android:layout_marginBottom="24dp"
     app:cardCornerRadius="28dp"
-    app:cardBackgroundColor="#E6000000"
+    app:cardBackgroundColor="#F20F172A"
     app:cardElevation="24dp">
 
     <ScrollView
@@ -20,383 +20,557 @@
         android:scrollIndicators="bottom"
         android:overScrollMode="ifContentScrolls">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="32dp">
-
-        <!-- Header -->
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Display Settings"
-            android:textColor="#FFFFFF"
-            android:textSize="28sp"
-            android:textStyle="bold"
-            android:gravity="center"
-            android:layout_marginBottom="32dp" />
-
-        <!-- Show Stats Toggle -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/settings_item_bg"
-            android:padding="16dp"
-            android:layout_marginBottom="16dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Show Stats"
-                    android:textColor="#FFFFFF"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="FPS, bitrate, resolution"
-                    android:textColor="#999999"
-                    android:textSize="13sp" />
-            </LinearLayout>
-
-            <com.google.android.material.switchmaterial.SwitchMaterial
-                android:id="@+id/showStatsSwitch"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:checked="true"
-                app:thumbTint="@color/switch_thumb_color"
-                app:trackTint="@color/switch_track_color" />
-        </LinearLayout>
-
-        <!-- Hide Settings Icon Toggle -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:background="@drawable/settings_item_bg"
-            android:padding="16dp"
-            android:layout_marginBottom="16dp">
-
-            <LinearLayout
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:orientation="vertical">
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Hide Settings Icon"
-                    android:textColor="#FFFFFF"
-                    android:textSize="17sp"
-                    android:textStyle="bold" />
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Use the back gesture to reveal it while streaming"
-                    android:textColor="#999999"
-                    android:textSize="13sp" />
-            </LinearLayout>
-
-            <com.google.android.material.switchmaterial.SwitchMaterial
-                android:id="@+id/hideSettingsSwitch"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:checked="false"
-                app:thumbTint="@color/switch_thumb_color"
-                app:trackTint="@color/switch_track_color" />
-        </LinearLayout>
-
-        <!-- Opacity Section -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="vertical"
-            android:background="@drawable/settings_item_bg"
-            android:padding="16dp"
-            android:layout_marginBottom="16dp">
+            android:padding="24dp">
 
+            <!-- Header -->
             <TextView
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Overlay Opacity"
-                android:textColor="#FFFFFF"
-                android:textSize="17sp"
+                android:text="Display &amp; HUD Settings"
+                android:textColor="#F8FAFC"
+                android:textSize="22sp"
                 android:textStyle="bold"
+                android:gravity="center"
                 android:layout_marginBottom="4dp" />
 
             <TextView
-                android:id="@+id/opacityValue"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="80%"
-                android:textColor="#4CAF50"
-                android:textSize="15sp"
-                android:layout_marginBottom="12dp" />
-
-            <com.google.android.material.slider.Slider
-                android:id="@+id/opacitySlider"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:valueFrom="0.2"
-                android:valueTo="1.0"
-                android:value="0.8"
-                android:stepSize="0.05"
-                app:thumbColor="#FFFFFF"
-                app:trackColorActive="#4CAF50"
-                app:trackColorInactive="#33FFFFFF"
-                app:trackHeight="4dp" />
-        </LinearLayout>
+                android:text="Customize orientation, cutout framing, and stream HUD"
+                android:textColor="#94A3B8"
+                android:textSize="12sp"
+                android:gravity="center"
+                android:layout_marginBottom="20dp" />
 
-        <!-- Settings Button Position - 8 directions -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical"
-            android:background="@drawable/settings_item_bg"
-            android:padding="16dp"
-            android:layout_marginBottom="16dp">
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Settings Button Position"
-                android:textColor="#FFFFFF"
-                android:textSize="17sp"
-                android:textStyle="bold"
-                android:layout_marginBottom="12dp" />
-
-            <!-- 8 Position Grid (3x3 without center) -->
+            <!-- Orientation + Camera Cutout Section -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="vertical">
+                android:orientation="vertical"
+                android:background="@drawable/settings_item_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp">
 
-                <!-- Top Row: TopLeft, TopCenter, TopRight -->
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Orientation"
+                    android:textColor="#F8FAFC"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="4dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Applies when Match Device Display is enabled on your Mac"
+                    android:textColor="#94A3B8"
+                    android:textSize="11sp"
+                    android:layout_marginBottom="10dp" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/orientationModeGroup"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="16dp"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/orientationAuto"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Auto"
+                        android:textAllCaps="false"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/mode_toggle_text"
+                        app:cornerRadius="12dp"
+                        app:backgroundTint="@color/mode_toggle_bg"
+                        app:strokeColor="#26FFFFFF"
+                        app:strokeWidth="1dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/orientationPortrait"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Portrait"
+                        android:textAllCaps="false"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/mode_toggle_text"
+                        app:cornerRadius="12dp"
+                        app:backgroundTint="@color/mode_toggle_bg"
+                        app:strokeColor="#26FFFFFF"
+                        app:strokeWidth="1dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/orientationLandscape"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Landscape"
+                        android:textAllCaps="false"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/mode_toggle_text"
+                        app:cornerRadius="12dp"
+                        app:backgroundTint="@color/mode_toggle_bg"
+                        app:strokeColor="#26FFFFFF"
+                        app:strokeWidth="1dp" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Camera Cutout"
+                    android:textColor="#F8FAFC"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="4dp" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Choose whether video extends into the camera cutout area"
+                    android:textColor="#94A3B8"
+                    android:textSize="11sp"
+                    android:layout_marginBottom="10dp" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/cutoutModeGroup"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/cutoutFill"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Fill to edges"
+                        android:textAllCaps="false"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/mode_toggle_text"
+                        app:cornerRadius="12dp"
+                        app:backgroundTint="@color/mode_toggle_bg"
+                        app:strokeColor="#26FFFFFF"
+                        app:strokeWidth="1dp" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/cutoutAvoid"
+                        android:layout_width="0dp"
+                        android:layout_height="44dp"
+                        android:layout_weight="1"
+                        android:text="Avoid cutout"
+                        android:textAllCaps="false"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:textColor="@color/mode_toggle_text"
+                        app:cornerRadius="12dp"
+                        app:backgroundTint="@color/mode_toggle_bg"
+                        app:strokeColor="#26FFFFFF"
+                        app:strokeWidth="1dp" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+            </LinearLayout>
+
+            <!-- HUD Toggles & Opacity Card -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/settings_item_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp">
+
+                <!-- Show Stats Toggle -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:layout_marginBottom="6dp">
+                    android:gravity="center_vertical"
+                    android:paddingBottom="12dp">
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/cornerTopLeft"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    <LinearLayout
                         android:layout_width="0dp"
-                        android:layout_height="44dp"
+                        android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="↖"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginEnd="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                        android:orientation="vertical">
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Show Stats HUD"
+                            android:textColor="#F8FAFC"
+                            android:textSize="15sp"
+                            android:textStyle="bold" />
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Floating pill for FPS, bitrate, resolution &amp; latency"
+                            android:textColor="#94A3B8"
+                            android:textSize="12sp" />
+                    </LinearLayout>
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/positionTopCenter"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:text="↑"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginStart="3dp"
-                        android:layout_marginEnd="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/cornerTopRight"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:text="↗"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginStart="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/showStatsSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="true"
+                        app:thumbTint="@color/switch_thumb_color"
+                        app:trackTint="@color/switch_track_color" />
                 </LinearLayout>
 
-                <!-- Middle Row: Left, (empty center), Right -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#14FFFFFF" />
+
+                <!-- Hide Settings Icon Toggle -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:orientation="horizontal"
-                    android:layout_marginBottom="6dp">
+                    android:gravity="center_vertical"
+                    android:paddingTop="12dp"
+                    android:paddingBottom="12dp">
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/positionCenterLeft"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    <LinearLayout
                         android:layout_width="0dp"
-                        android:layout_height="44dp"
+                        android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="←"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginEnd="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                        android:orientation="vertical">
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Auto-Hide Settings Button"
+                            android:textColor="#F8FAFC"
+                            android:textSize="15sp"
+                            android:textStyle="bold" />
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="Swipe Back while streaming to reveal temporarily"
+                            android:textColor="#94A3B8"
+                            android:textSize="12sp" />
+                    </LinearLayout>
 
-                    <!-- Empty center space -->
-                    <View
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:layout_marginStart="3dp"
-                        android:layout_marginEnd="3dp" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/positionCenterRight"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:text="→"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginStart="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                    <com.google.android.material.switchmaterial.SwitchMaterial
+                        android:id="@+id/hideSettingsSwitch"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:checked="false"
+                        app:thumbTint="@color/switch_thumb_color"
+                        app:trackTint="@color/switch_track_color" />
                 </LinearLayout>
 
-                <!-- Bottom Row: BottomLeft, BottomCenter, BottomRight -->
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#14FFFFFF"
+                    android:layout_marginBottom="12dp" />
+
+                <!-- Opacity Slider -->
                 <LinearLayout
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:orientation="horizontal">
+                    android:orientation="horizontal"
+                    android:gravity="center_vertical"
+                    android:layout_marginBottom="4dp">
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/cornerBottomLeft"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    <TextView
                         android:layout_width="0dp"
-                        android:layout_height="44dp"
+                        android:layout_height="wrap_content"
                         android:layout_weight="1"
-                        android:text="↙"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginEnd="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                        android:text="HUD &amp; Button Opacity"
+                        android:textColor="#F8FAFC"
+                        android:textSize="15sp"
+                        android:textStyle="bold" />
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/positionBottomCenter"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:text="↓"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginStart="3dp"
-                        android:layout_marginEnd="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                    <TextView
+                        android:id="@+id/opacityValue"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:text="80%"
+                        android:textColor="#34D399"
+                        android:textSize="13sp"
+                        android:textStyle="bold"
+                        android:typeface="monospace" />
+                </LinearLayout>
 
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/cornerBottomRight"
-                        style="@style/Widget.MaterialComponents.Button.OutlinedButton"
-                        android:layout_width="0dp"
-                        android:layout_height="44dp"
-                        android:layout_weight="1"
-                        android:text="↘"
-                        android:textColor="#FFFFFF"
-                        android:textSize="18sp"
-                        android:layout_marginStart="3dp"
-                        app:cornerRadius="10dp"
-                        app:strokeColor="#4CAF50"
-                        app:strokeWidth="1dp" />
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/opacitySlider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:valueFrom="0.2"
+                    android:valueTo="1.0"
+                    android:value="0.8"
+                    android:stepSize="0.05"
+                    app:thumbColor="#F8FAFC"
+                    app:trackColorActive="#10B981"
+                    app:trackColorInactive="#33FFFFFF"
+                    app:trackHeight="4dp" />
+            </LinearLayout>
+
+            <!-- Settings Button Position - 8 directions -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:background="@drawable/settings_item_bg"
+                android:padding="16dp"
+                android:layout_marginBottom="12dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Settings Button Anchor"
+                    android:textColor="#F8FAFC"
+                    android:textSize="15sp"
+                    android:textStyle="bold"
+                    android:layout_marginBottom="10dp" />
+
+                <!-- 8 Position Grid (3x3 with Screen preview in center) -->
+                <LinearLayout
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                    <!-- Top Row: TopLeft, TopCenter, TopRight -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:layout_marginBottom="6dp">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/cornerTopLeft"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↖"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginEnd="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/positionTopCenter"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↑"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginStart="3dp"
+                            android:layout_marginEnd="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/cornerTopRight"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↗"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginStart="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+                    </LinearLayout>
+
+                    <!-- Middle Row: Left, Screen center indicator, Right -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:layout_marginBottom="6dp">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/positionCenterLeft"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="←"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginEnd="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:layout_marginStart="3dp"
+                            android:layout_marginEnd="3dp"
+                            android:gravity="center"
+                            android:text="DISPLAY"
+                            android:textColor="#64748B"
+                            android:textSize="10sp"
+                            android:textStyle="bold"
+                            android:letterSpacing="0.08" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/positionCenterRight"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="→"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginStart="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+                    </LinearLayout>
+
+                    <!-- Bottom Row: BottomLeft, BottomCenter, BottomRight -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/cornerBottomLeft"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↙"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginEnd="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/positionBottomCenter"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↓"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginStart="3dp"
+                            android:layout_marginEnd="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+
+                        <com.google.android.material.button.MaterialButton
+                            android:id="@+id/cornerBottomRight"
+                            style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                            android:layout_width="0dp"
+                            android:layout_height="42dp"
+                            android:layout_weight="1"
+                            android:text="↘"
+                            android:textColor="#F8FAFC"
+                            android:textSize="16sp"
+                            android:layout_marginStart="3dp"
+                            app:cornerRadius="10dp"
+                            app:strokeColor="#33FFFFFF"
+                            app:strokeWidth="1dp" />
+                    </LinearLayout>
+
                 </LinearLayout>
 
             </LinearLayout>
 
-        </LinearLayout>
+            <!-- Action Buttons Row -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginTop="4dp"
+                android:gravity="center">
 
-        <!-- Action Buttons Row 1 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:layout_marginTop="8dp"
-            android:gravity="center">
+                <!-- Reset Overlay Position Button -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/resetPositionButton"
+                    style="@style/Widget.MaterialComponents.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="46dp"
+                    android:layout_weight="1"
+                    android:text="Reset HUD Position"
+                    android:textAllCaps="false"
+                    android:textColor="#CBD5E1"
+                    android:textSize="12sp"
+                    android:layout_marginEnd="4dp"
+                    app:cornerRadius="12dp"
+                    app:strokeColor="#26FFFFFF"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="#14FFFFFF" />
 
-            <!-- Reset Overlay Position Button -->
+                <!-- Reset Settings Button Position -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/resetSettingsButton"
+                    style="@style/Widget.MaterialComponents.Button.TextButton"
+                    android:layout_width="0dp"
+                    android:layout_height="46dp"
+                    android:layout_weight="1"
+                    android:text="Reset Button Anchor"
+                    android:textAllCaps="false"
+                    android:textColor="#CBD5E1"
+                    android:textSize="12sp"
+                    android:layout_marginStart="4dp"
+                    app:cornerRadius="12dp"
+                    app:strokeColor="#26FFFFFF"
+                    app:strokeWidth="1dp"
+                    app:backgroundTint="#14FFFFFF" />
+            </LinearLayout>
+
+            <!-- Disconnect Button -->
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/resetPositionButton"
+                android:id="@+id/disconnectSettingsButton"
                 style="@style/Widget.MaterialComponents.Button.TextButton"
-                android:layout_width="0dp"
+                android:layout_width="match_parent"
                 android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Reset Overlay"
-                android:textColor="#FFFFFF"
-                android:textSize="12sp"
-                android:layout_marginEnd="4dp"
+                android:text="Disconnect Session"
+                android:textAllCaps="false"
+                android:textColor="#FCA5A5"
+                android:textSize="14sp"
+                android:textStyle="bold"
+                android:layout_marginTop="8dp"
                 app:cornerRadius="14dp"
-                app:strokeColor="#33FFFFFF"
+                app:strokeColor="#7F1D1D"
                 app:strokeWidth="1dp"
-                app:backgroundTint="#1AFFFFFF" />
+                app:backgroundTint="#26EF4444" />
 
-            <!-- Reset Settings Button Position -->
+            <!-- Close Button -->
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/resetSettingsButton"
-                style="@style/Widget.MaterialComponents.Button.TextButton"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="Reset Button"
-                android:textColor="#FFFFFF"
-                android:textSize="12sp"
-                android:layout_marginStart="4dp"
-                app:cornerRadius="14dp"
-                app:strokeColor="#33FFFFFF"
-                app:strokeWidth="1dp"
-                app:backgroundTint="#1AFFFFFF" />
+                android:id="@+id/closeButton"
+                android:layout_width="match_parent"
+                android:layout_height="54dp"
+                android:text="Done"
+                android:textAllCaps="false"
+                android:textColor="#052E16"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginTop="12dp"
+                app:cornerRadius="16dp"
+                app:backgroundTint="#34D399" />
+
         </LinearLayout>
-
-        <!-- Disconnect Button -->
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/disconnectSettingsButton"
-            style="@style/Widget.MaterialComponents.Button.TextButton"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:text="Disconnect"
-            android:textColor="#F44336"
-            android:textSize="13sp"
-            android:layout_marginTop="8dp"
-            app:cornerRadius="14dp"
-            app:strokeColor="#F44336"
-            app:strokeWidth="1dp"
-            app:backgroundTint="#1AF44336" />
-
-        <!-- Close Button -->
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/closeButton"
-            android:layout_width="match_parent"
-            android:layout_height="56dp"
-            android:text="DONE"
-            android:textSize="16sp"
-            android:textStyle="bold"
-            android:layout_marginTop="16dp"
-            app:cornerRadius="16dp"
-            app:backgroundTint="#4CAF50" />
-
-    </LinearLayout>
     </ScrollView>
 </androidx.cardview.widget.CardView>

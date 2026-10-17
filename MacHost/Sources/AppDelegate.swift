@@ -2,21 +2,24 @@ import Cocoa
 import SwiftUI
 import Combine
 import ApplicationServices
-import os.log
+import os
 @preconcurrency import ScreenCaptureKit
 
 // Debug file logger - writes to /tmp/sidescreen.log
+private let logQueue = DispatchQueue(label: "com.sidescreen.log", qos: .utility)
 func debugLog(_ message: String) {
     let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
     let line = "[\(timestamp)] \(message)\n"
     print(message)
-    if let data = line.data(using: .utf8) {
+    logQueue.async {
         let url = URL(fileURLWithPath: "/tmp/sidescreen.log")
         if let handle = try? FileHandle(forWritingTo: url) {
             handle.seekToEndOfFile()
-            handle.write(data)
-            handle.closeFile()
-        } else {
+            if let data = line.data(using: .utf8) {
+                handle.write(data)
+            }
+            try? handle.close()
+        } else if let data = line.data(using: .utf8) {
             try? data.write(to: url)
         }
     }
@@ -42,7 +45,7 @@ struct GestureThresholds {
     static let longPressTime: UInt64 = 500_000_000     // 500ms
     static let scrollSensitivity: CGFloat = 1.2
     static let pinchMinDistance: CGFloat = 20
-    static let minTouchInterval: UInt64 = 8_000_000    // ~120Hz
+    static let minTouchInterval: UInt64 = 3_000_000    // ~333Hz; finer than any client touch rate
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -67,6 +70,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// The effective refresh rate the running pipeline was built with — lets
     /// the refresh-rate observer skip restarts that would change nothing.
     private var lastAppliedRefreshRate: Int?
+    /// Latest type-15 advert applied to the display; sizes the display on the
+    /// next start so a restart comes up matched. Main-actor confined.
+    private var lastKnownCaps: ClientCapabilities?
+    /// Newest advert waiting for `handlePanelChange` (latest wins).
+    private var pendingCaps: ClientCapabilities?
+    /// A panel change is being applied; later adverts queue in `pendingCaps`.
+    private var isReconfiguring = false
+    /// HDR state requested for the live display (`vdm.isHDR` may be false
+    /// when the OS lacks HDR modes; this avoids recreate loops).
+    private var displayRequestedHDR = false
+    /// Format and fps the live encoder reports, for the status row.
+    private var streamFormat: (format: StreamColorFormat, fps: Int)?
+    /// `settings.transformSettings`, mirrored on the main thread for the
+    /// server's network queue and the encoder threads.
+    private let transformMirror = OSAllocatedUnfairLock(initialState: DisplayTransformSettings())
+    private var screenParamsObserver: NSObjectProtocol?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -80,6 +99,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Setup settings observers
         setupSettingsObservers()
+
+        // Touch maps through the virtual display's bounds; re-read them only
+        // when the display arrangement or mode changes.
+        screenParamsObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.refreshTouchBounds()
+        }
 
         // Check permissions
         Task {
@@ -159,6 +188,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let port = Int(settings.port)
+        let isStreaming = settings.isRunning && settings.clientConnected
+        guard !isStreaming else { return }
         Task.detached { [weak self] in
             let devices = StatusDetector.usbDevices()
             let reverseOK = StatusDetector.adbReverseConfigured(port: port)
@@ -240,12 +271,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        // Mirror first (it emits the current values at once) for the threads
+        // that must not read @Published settings.
+        Publishers.CombineLatest4(settings.$matchDevice, settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
+            .sink { [weak self] matchDevice, rotation, flipHorizontal, flipVertical in
+                let mirrored = DisplayTransformSettings(matchDevice: matchDevice, rotation: rotation,
+                                                        flipHorizontal: flipHorizontal, flipVertical: flipVertical)
+                self?.transformMirror.withLock { $0 = mirrored }
+            }
+            .store(in: &cancellables)
+
         Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
             .dropFirst()
             .sink { [weak self] rotation, flipHorizontal, flipVertical in
                 guard let self = self, self.settings.isRunning else { return }
-                print("🔄 Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
-                self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
+                // The client owns orientation while matching the device, if it advertised its panel.
+                var transform = self.settings.transformSettings
+                transform.rotation = rotation
+                let advertised = self.streamingServer?.clientCapabilities != nil
+                let transformRotation = transform.hostRotation(clientAdvertisesPanel: advertised)
+                print("🔄 Display transform changed: \(transformRotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+                self.streamingServer?.updateDisplayTransform(rotation: transformRotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
             }
             .store(in: &cancellables)
 
@@ -277,7 +323,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] resolution in
-                self?.restartRunningServer(reason: "Resolution changed to \(resolution)")
+                guard let self = self else { return }
+                // A matched display ignores the configured resolution.
+                if self.settings.matchDevice && self.lastKnownCaps != nil { return }
+                self.restartRunningServer(reason: "Resolution changed to \(resolution)")
+            }
+            .store(in: &cancellables)
+
+        // HDR mode decides the virtual display's transfer function and the
+        // capture preset; Match device decides its size and who owns
+        // orientation (type-16 bit1). Both need a rebuild.
+        settings.$hdrMode
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] mode in
+                self?.restartRunningServer(reason: "HDR mode changed to \(mode.rawValue)")
+            }
+            .store(in: &cancellables)
+
+        settings.$matchDevice
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] match in
+                self?.restartRunningServer(reason: "Match device \(match ? "enabled" : "disabled")")
             }
             .store(in: &cancellables)
 
@@ -413,11 +481,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         await MainActor.run {
             settings.hasAccessibilityPermission = trusted
         }
-        if trusted {
-            print("✅ Accessibility permission granted")
-        } else {
-            print("⚠️  Accessibility permission not granted - touch control will not work")
-        }
+        debugLog(trusted ? "Accessibility permission granted"
+                         : "Accessibility permission not granted - touch control will not work")
     }
 
     @MainActor
@@ -568,14 +633,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         do {
-            // Create virtual display and run ADB setup in parallel
+            // Create virtual display and run ADB setup in parallel. With
+            // "Match device" and a known client panel, the display is sized to
+            // it from the start; otherwise the configured resolution is used
+            // until the client advertises its presentation area.
             virtualDisplayManager = VirtualDisplayManager()
-            let size = settings.resolutionSize
+            let (caps, initialRotation) = await MainActor.run {
+                (lastKnownCaps, settings.transformSettings.hostRotation(clientAdvertisesPanel: lastKnownCaps != nil))
+            }
+            let plan = displayPlan(for: caps)
+            let wantHDR = wantsHDRDisplay
+            displayRequestedHDR = wantHDR
             try virtualDisplayManager?.createDisplay(
-                width: size.width,
-                height: size.height,
-                refreshRate: settings.refreshRate,
-                hiDPI: settings.hiDPI,
+                width: plan.logicalWidth,
+                height: plan.logicalHeight,
+                refreshRate: settings.effectiveRefreshRate,
+                hiDPI: plan.hiDPI,
+                hdr: wantHDR,
                 name: "SideScreen"
             )
 
@@ -609,6 +683,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if !registered {
                     debugLog("WARNING: Virtual display not found in online display list — capture may fail")
                 }
+                // Blocks ~300 ms; WindowServer needs the main run loop to publish the mode list.
+                let selected = await Task.detached(priority: .userInitiated) { vdm.applyPlannedMode() }.value
+                if !selected { debugLog("WARNING: planned display mode not adopted — WindowServer default kept") }
             }
 
             // Setup capture
@@ -627,8 +704,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
+            // Fires on arbitrary threads with the encoder's achieved format.
+            // Type 16 must precede the display config that follows a change,
+            // so it goes to the server synchronously.
+            screenCapture?.onStreamFormatChanged = { [weak self] format, fps in
+                guard let self = self else { return }
+                self.publishStreamFormat(format, fps: fps, to: self.streamingServer)
+                Task { @MainActor in
+                    self.streamFormat = (format, fps)
+                    self.updateStreamFormatDescription()
+                }
+            }
             lastAppliedRefreshRate = settings.effectiveRefreshRate
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            try await screenCapture?.setupForVirtualDisplay(
+                displayID,
+                refreshRate: settings.effectiveRefreshRate,
+                hdrMode: settings.hdrMode,
+                displayIsHDR: virtualDisplayManager?.isHDR ?? false
+            )
 
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
@@ -650,31 +743,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // check capabilities against a resolution it will never receive. The
             // logical desktop travels separately, for display only.
             let initialEncode = ScreenCapture.physicalSize(for: displayID)
-            streamingServer?.setDesktopSize(width: size.width, height: size.height)
-            streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
+            streamingServer?.setDesktopSize(width: plan.logicalWidth, height: plan.logicalHeight)
+            streamingServer?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: initialRotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
+                // The connect-time advert (type 15) precedes startup and is
+                // only negotiated; bring the display to the client's panel now.
+                let caps = self.streamingServer?.clientCapabilities
                 Task { @MainActor in
                     self.settings.clientConnected = true
+                    if let caps { await self.handlePanelChange(caps) }
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
             // display config is sent, so the config below carries the right
             // dimensions for the negotiated codec.
             streamingServer?.onCodecNegotiated = { [weak self] codec in
-                guard let self = self, let capture = self.screenCapture else { return }
+                guard let self = self, let capture = self.screenCapture, let server = self.streamingServer else { return }
                 capture.negotiate(
                     codec: codec,
-                    clientLimit: self.streamingServer?.clientDecodeLimits,
-                    clientLimitTable: self.streamingServer?.clientDecodeLimitTable
+                    clientLimit: server.clientDecodeLimits,
+                    clientLimitTable: server.clientDecodeLimitTable,
+                    clientCapabilities: server.clientCapabilities
                 )
+                // The format may predate this client: refresh type 16's
+                // matches-panel flag now that its capabilities are known.
+                self.publishStreamFormat(capture.activeStreamFormat, fps: capture.encodeFps, to: server)
                 let enc = capture.encodeSize(for: codec)
                 // Whatever the codec negotiation settled on, this is what the
                 // stream's SPS will carry, so it is what the client must size
                 // its decoder for.
-                self.streamingServer?.setDesktopSize(width: size.width, height: size.height)
-                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                let transform = self.transformMirror.withLock { $0 }
+                let rotation = transform.hostRotation(clientAdvertisesPanel: server.clientCapabilities != nil)
+                server.setDisplaySize(width: enc.width, height: enc.height, rotation: rotation,
+                                      flipHorizontal: transform.flipHorizontal, flipVertical: transform.flipVertical)
+                Task { @MainActor in self.updateStreamFormatDescription() }
+            }
+            // Rotation, fold switch, cutout-mode change: re-mode the display
+            // on the live connection.
+            streamingServer?.onClientCapabilities = { [weak self] caps in
+                Task { @MainActor in await self?.handlePanelChange(caps) }
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
@@ -714,17 +823,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     userInfo: [NSLocalizedDescriptionKey: "The streaming server could not be created."]
                 )
             }
+            screenCapture?.shouldSkipEncode = { [weak server] in server?.isBackpressured ?? false }
             try await server.start()
             screenCapture?.startStreaming(
                 to: server,
                 bitrateMbps: settings.effectiveBitrate,
                 quality: settings.effectiveQuality,
-                gamingBoost: settings.gamingBoost,
-                frameRate: settings.effectiveRefreshRate
+                gamingBoost: settings.gamingBoost
             )
 
             await MainActor.run {
                 settings.isRunning = true
+                refreshTouchBounds()
+            }
+            // An advert that landed while starting found the server not yet
+            // running; apply it now.
+            if let caps = server.clientCapabilities {
+                Task { @MainActor [weak self] in await self?.handlePanelChange(caps) }
             }
 
             print("✅ Server started on port \(settings.port)")
@@ -789,6 +904,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamingServer = nil
         virtualDisplayManager = nil
         currentWirelessDevice = nil
+        pendingCaps = nil
+        streamFormat = nil
+        touchDisplayBounds = nil
 
         settings.isRunning = false
         settings.displayCreated = false
@@ -796,6 +914,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.currentWirelessDevice = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+        settings.streamFormatDescription = ""
     }
 
     func stopServer() {
@@ -804,12 +923,329 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         print("⏹️ Server stopped")
     }
 
+    /// Type 16 for the live encoder; any thread. `matchesPanel` (the client
+    /// owns orientation) needs "Match device" AND a client that advertised its
+    /// panel; old clients keep host rotation.
+    private func publishStreamFormat(_ format: StreamColorFormat, fps: Int, to server: StreamingServer?) {
+        guard let server else { return }
+        let advertised = server.clientCapabilities != nil
+        let matching = transformMirror.withLock { $0 }.clientOwnsOrientation(clientAdvertisesPanel: advertised)
+        server.setStreamFormat(format, fps: fps, matchesPanel: matching)
+    }
+
+    // MARK: - Display plan & panel changes (type 15)
+
+    /// Display geometry for a start or re-mode: the client's presentation
+    /// area while matching the device and its panel is known, else the
+    /// configured resolution.
+    private func displayPlan(for caps: ClientCapabilities?) -> DisplayPlan {
+        if settings.matchDevice, let caps, caps.presentationWidth > 0, caps.presentationHeight > 0 {
+            return DisplayPlan.resolve(
+                presentationWidth: caps.presentationWidth,
+                presentationHeight: caps.presentationHeight,
+                hiDPIRequested: settings.hiDPI
+            )
+        }
+        let size = settings.resolutionSize(clientAdvertisesPanel: caps != nil)
+        let scale = settings.hiDPI ? 2 : 1
+        return DisplayPlan(logicalWidth: size.width, logicalHeight: size.height, hiDPI: settings.hiDPI,
+                           physicalWidth: size.width * scale, physicalHeight: size.height * scale)
+    }
+
+    /// Whether the virtual display itself should be an HDR (EDR) display. Independent of the
+    /// client: SDR clients get an SDR capture of the EDR display, so a client's first advert
+    /// never forces a display recreate (only toggling the HDR setting does).
+    private var wantsHDRDisplay: Bool {
+        guard ScreenCapture.captureSupportsHDR else { return false }
+        return settings.hdrMode != .off
+    }
+
+    private enum PanelChangeOutcome {
+        case applied
+        /// The server was stopped or restarted meanwhile; nothing to do.
+        case superseded
+        case failed(String)
+    }
+
+    /// One entry point for rotation, fold switch and cutout-mode change
+    /// (plan §3/§11). Serialised and latest-wins: adverts arriving while one
+    /// is applied replace `pendingCaps`, and only the newest is applied next.
+    /// The StreamingServer and its connection are never touched; a failure
+    /// falls back to a full server restart.
+    @MainActor
+    private func handlePanelChange(_ caps: ClientCapabilities) async {
+        pendingCaps = caps
+        guard !isReconfiguring else { return }
+        isReconfiguring = true
+        defer { isReconfiguring = false }
+
+        while let next = pendingCaps ?? newerServerCaps() {
+            pendingCaps = nil
+            guard settings.isRunning,
+                  let server = streamingServer,
+                  let capture = screenCapture,
+                  let vdm = virtualDisplayManager else { return }
+            switch await applyPanelChange(next, server: server, capture: capture, vdm: vdm) {
+            case .applied:
+                lastKnownCaps = next
+            case .superseded:
+                pendingCaps = nil
+                return
+            case .failed(let reason):
+                pendingCaps = nil
+                lastKnownCaps = next
+                restartRunningServer(reason: "Display re-mode failed (\(reason))")
+                return
+            }
+        }
+    }
+
+    /// The live connection's advert when it differs from the last applied
+    /// one: catches an advert whose main-actor hop was overtaken by an older one.
+    @MainActor
+    private func newerServerCaps() -> ClientCapabilities? {
+        guard let caps = streamingServer?.clientCapabilities, caps != lastKnownCaps else { return nil }
+        return caps
+    }
+
+    @MainActor
+    private func applyPanelChange(
+        _ caps: ClientCapabilities,
+        server: StreamingServer,
+        capture: ScreenCapture,
+        vdm: VirtualDisplayManager
+    ) async -> PanelChangeOutcome {
+        let plan = displayPlan(for: caps)
+        let wantHDR = wantsHDRDisplay
+
+        if wantHDR != displayRequestedHDR {
+            debugLog("Panel change: display HDR \(displayRequestedHDR) -> \(wantHDR) — recreating display")
+            return await recreateDisplay(plan, caps: caps, server: server, capture: capture, vdm: vdm)
+        }
+
+        let target = (plan.physicalWidth, plan.physicalHeight)
+        let sizeChanged = settings.matchDevice && vdm.physicalSize.map { $0 != target } ?? true
+        if sizeChanged {
+            let outcome = await remodeInPlace(plan, caps: caps, server: server, capture: capture, vdm: vdm)
+            guard case .failed(let reason) = outcome else { return outcome }
+            debugLog("In-place re-mode failed (\(reason)) — recreating display")
+            return await recreateDisplay(plan, caps: caps, server: server, capture: capture, vdm: vdm)
+        }
+
+        if caps != lastKnownCaps {
+            renegotiate(caps, server: server, capture: capture, vdm: vdm)
+        }
+        return .applied
+    }
+
+    /// Fast path (§11): new modes on the live display (same ID), the same
+    /// SCStream retargeted, a new encoder, a new stream segment. ~100–200 ms.
+    /// Wire order: old frames → new segment + display config → new-size IDR.
+    @MainActor
+    private func remodeInPlace(
+        _ plan: DisplayPlan,
+        caps: ClientCapabilities,
+        server: StreamingServer,
+        capture: ScreenCapture,
+        vdm: VirtualDisplayManager
+    ) async -> PanelChangeOutcome {
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let refreshRate = lastAppliedRefreshRate ?? settings.effectiveRefreshRate
+        // Negotiate first: a capture restart it triggers is serialised ahead
+        // of the resize below instead of racing it.
+        if caps != lastKnownCaps {
+            renegotiate(caps, server: server, capture: capture, vdm: vdm)
+        }
+        // Blocks up to 500 ms polling for the new mode: keep it off the main thread.
+        let remoded = await Task.detached(priority: .userInitiated) {
+            vdm.reconfigure(width: plan.logicalWidth, height: plan.logicalHeight,
+                            refreshRate: refreshRate, hiDPI: plan.hiDPI)
+        }.value
+        guard streamingServer === server else { return .superseded }
+        guard remoded, let displayID = vdm.displayID else { return .failed("reconfigure returned false") }
+
+        let physical = await settledPhysicalSize(of: displayID, plan: plan)
+        guard streamingServer === server else { return .superseded }
+        do {
+            // Waits for any capture restart in flight (e.g. the connect-time
+            // negotiation's) before retargeting the stream.
+            try await capture.resize(width: physical.width, height: physical.height)
+        } catch {
+            guard streamingServer === server else { return .superseded }
+            return .failed("capture resize: \(error.localizedDescription)")
+        }
+        guard streamingServer === server else { return .superseded }
+
+        capture.startNewSegment {
+            server.beginNewStreamSegment()
+            announceDisplay(server: server, capture: capture, displayID: displayID, plan: plan)
+        }
+        // Covers an idle display: re-encodes the cached frame on the new encoder.
+        capture.requestKeyframeOrReplayCachedFrame(force: true)
+        refreshTouchBounds()
+        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000
+        debugLog("Display re-moded in place to \(plan.logicalWidth)x\(plan.logicalHeight)\(plan.hiDPI ? " HiDPI" : "") in \(elapsedMs) ms")
+        return .applied
+    }
+
+    /// The adopted mode's physical size, re-polled for up to ~200 ms while it
+    /// differs from the plan: CG can report a transient (e.g. 1×) mode right
+    /// after apply. Returns the last read when it never matches.
+    @MainActor
+    private func settledPhysicalSize(of displayID: CGDirectDisplayID, plan: DisplayPlan) async -> (width: Int, height: Int) {
+        let planned = (plan.physicalWidth, plan.physicalHeight)
+        var physical = ScreenCapture.physicalSize(for: displayID)
+        var polls = 0
+        while physical != planned, polls < 20 {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            physical = ScreenCapture.physicalSize(for: displayID)
+            polls += 1
+        }
+        if physical != planned {
+            debugLog("Re-mode read back \(physical.width)x\(physical.height), planned \(plan.physicalWidth)x\(plan.physicalHeight)")
+        }
+        return physical
+    }
+
+    /// Fallback: destroy and recreate the virtual display (new ID), re-set up
+    /// capture on the same ScreenCapture, and resume on the same connection.
+    /// Also the only way to switch the display's HDR state. ~1–2 s.
+    @MainActor
+    private func recreateDisplay(
+        _ plan: DisplayPlan,
+        caps: ClientCapabilities,
+        server: StreamingServer,
+        capture: ScreenCapture,
+        vdm: VirtualDisplayManager
+    ) async -> PanelChangeOutcome {
+        let startNs = DispatchTime.now().uptimeNanoseconds
+        let refreshRate = lastAppliedRefreshRate ?? settings.effectiveRefreshRate
+        let hdr = wantsHDRDisplay
+        vdm.saveDisplayPosition()
+        capture.stopStreaming()
+        do {
+            // Replaces the live display (createDisplay destroys it first).
+            try vdm.createDisplay(width: plan.logicalWidth, height: plan.logicalHeight, refreshRate: refreshRate,
+                                  hiDPI: plan.hiDPI, hdr: hdr, name: "SideScreen")
+        } catch {
+            return .failed("createDisplay: \(error.localizedDescription)")
+        }
+        displayRequestedHDR = hdr
+        try? vdm.disableMirrorMode()
+        // Same settle time as startServer before the display is capturable.
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        guard streamingServer === server else { return .superseded }
+        vdm.restoreDisplayPosition()
+        if !vdm.verifyDisplayRegistered() {
+            debugLog("WARNING: Recreated virtual display not found in online display list — capture may fail")
+        }
+        if !(await Task.detached(priority: .userInitiated) { vdm.applyPlannedMode() }.value) {
+            debugLog("WARNING: planned display mode not adopted — WindowServer default kept")
+        }
+        guard streamingServer === server else { return .superseded }
+        guard let displayID = vdm.displayID else { return .failed("recreated display has no ID") }
+
+        // Negotiate first so the stream is set up for the new caps' fps/format.
+        negotiate(caps, server: server, capture: capture)
+        do {
+            try await capture.setupForVirtualDisplay(displayID, refreshRate: refreshRate,
+                                                     hdrMode: settings.hdrMode, displayIsHDR: vdm.isHDR)
+        } catch {
+            return .failed("capture setup: \(error.localizedDescription)")
+        }
+        guard streamingServer === server else { return .superseded }
+
+        server.beginNewStreamSegment()
+        // Installs the encoder synchronously, so a changed format (type 16)
+        // goes out before the display config below.
+        capture.startStreaming(to: server, bitrateMbps: settings.effectiveBitrate,
+                               quality: settings.effectiveQuality, gamingBoost: settings.gamingBoost)
+        announceDisplay(server: server, capture: capture, displayID: displayID, plan: plan)
+        capture.requestKeyframeOrReplayCachedFrame(force: true)
+        refreshTouchBounds()
+        let elapsedMs = (DispatchTime.now().uptimeNanoseconds - startNs) / 1_000_000
+        debugLog("Display recreated at \(plan.logicalWidth)x\(plan.logicalHeight)\(plan.hiDPI ? " HiDPI" : "")\(vdm.isHDR ? " HDR" : "") in \(elapsedMs) ms")
+        return .applied
+    }
+
+    /// Same display, changed HDR/fps capabilities: re-negotiate only. When the
+    /// encode size changes, the new segment and display config go out after
+    /// the old encoder's last frame and before the new one's IDR.
+    @MainActor
+    private func renegotiate(_ caps: ClientCapabilities, server: StreamingServer, capture: ScreenCapture, vdm: VirtualDisplayManager) {
+        let before = capture.encodeSize(for: capture.codec)
+        let plan = displayPlan(for: caps)
+        var announced = false
+        negotiate(caps, server: server, capture: capture) {
+            guard let displayID = vdm.displayID else { return }
+            server.beginNewStreamSegment()
+            announceDisplay(server: server, capture: capture, displayID: displayID, plan: plan)
+            announced = true
+        }
+        let after = capture.encodeSize(for: capture.codec)
+        guard after != before, let displayID = vdm.displayID else {
+            updateStreamFormatDescription()
+            return
+        }
+        if !announced {
+            // No live encoder to swap: just announce the new size.
+            server.beginNewStreamSegment()
+            announceDisplay(server: server, capture: capture, displayID: displayID, plan: plan)
+        }
+        capture.requestKeyframeOrReplayCachedFrame(force: true)
+    }
+
+    private func negotiate(_ caps: ClientCapabilities, server: StreamingServer, capture: ScreenCapture,
+                           openSegment: () -> Void = {}) {
+        capture.negotiate(codec: capture.codec, clientLimit: server.clientDecodeLimits,
+                          clientLimitTable: server.clientDecodeLimitTable, clientCapabilities: caps,
+                          openSegment: openSegment)
+    }
+
+    /// Sends the display config for the live encode size (and the logical
+    /// desktop as macOS actually laid it out).
+    @MainActor
+    private func announceDisplay(server: StreamingServer, capture: ScreenCapture, displayID: CGDirectDisplayID, plan: DisplayPlan) {
+        let desktop = CGDisplayBounds(displayID).size
+        if desktop.width > 0, desktop.height > 0 {
+            server.setDesktopSize(width: Int(desktop.width), height: Int(desktop.height))
+        } else {
+            server.setDesktopSize(width: plan.logicalWidth, height: plan.logicalHeight)
+        }
+        let enc = capture.encodeSize(for: capture.codec)
+        let transform = settings.transformSettings
+        let rotation = transform.hostRotation(clientAdvertisesPanel: server.clientCapabilities != nil)
+        server.setDisplaySize(width: enc.width, height: enc.height, rotation: rotation,
+                              flipHorizontal: transform.flipHorizontal, flipVertical: transform.flipVertical)
+        server.sendDisplaySize()
+        updateStreamFormatDescription()
+    }
+
+    /// "HDR10 · 10-bit · 120 fps · 2340×1080" from the live encoder.
+    @MainActor
+    private func updateStreamFormatDescription() {
+        guard let capture = screenCapture, let streamFormat else {
+            settings.streamFormatDescription = ""
+            return
+        }
+        let enc = capture.encodeSize(for: capture.codec)
+        settings.streamFormatDescription = DisplaySettings.describeStreamFormat(
+            streamFormat.format, fps: streamFormat.fps, width: enc.width, height: enc.height)
+    }
+
+    private func refreshTouchBounds() {
+        touchDisplayBounds = virtualDisplayManager?.displayID.map { (id: $0, bounds: CGDisplayBounds($0)) }
+    }
+
     // MARK: - Gesture Properties
 
     private let eventSource = CGEventSource(stateID: .hidSystemState)
     private var accessibilityWarningShown = false
     private var gestureState: GestureState = .idle
     private var lastTouchTime: UInt64 = 0
+    /// `CGDisplayBounds` of the virtual display, cached off the per-event path;
+    /// refreshed on screen-parameter changes and after every re-mode.
+    private var touchDisplayBounds: (id: CGDirectDisplayID, bounds: CGRect)?
 
     // Touch tracking
     private var touchStartPosition: CGPoint = .zero
@@ -844,7 +1280,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
-                print("⚠️  Accessibility not granted - touch ignored")
+                debugLog("Accessibility not granted - touch ignored")
                 Task { @MainActor in
                     settings.hasAccessibilityPermission = false
                 }
@@ -853,7 +1289,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         guard let displayID = virtualDisplayManager?.displayID else { return }
-        let bounds = CGDisplayBounds(displayID)
+        if touchDisplayBounds?.id != displayID {
+            refreshTouchBounds()
+        }
+        guard let bounds = touchDisplayBounds?.bounds else { return }
 
         let p1 = CGPoint(
             x: bounds.origin.x + CGFloat(x) * bounds.width,

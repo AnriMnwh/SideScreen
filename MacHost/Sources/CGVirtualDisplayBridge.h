@@ -35,12 +35,17 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) uint32_t width;
 @property (nonatomic, readonly) uint32_t height;
 @property (nonatomic, readonly) double refreshRate;
+// Present on newer macOS only; guard with +instancesRespondToSelector: before use.
+// transferFunction 1 yields an HDR/EDR display.
+@property (nonatomic, readonly) uint32_t transferFunction;
 
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height refreshRate:(double)refreshRate;
+- (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height refreshRate:(double)refreshRate transferFunction:(uint32_t)transferFunction;
 @end
 
 @interface CGVirtualDisplaySettings : NSObject
 @property (nonatomic, assign) uint32_t hiDPI;
+@property (nonatomic, assign) uint32_t refreshDeadline;
 @property (nonatomic, retain) NSArray<CGVirtualDisplayMode *> *modes;
 
 - (instancetype)init;
@@ -59,6 +64,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) NSArray<CGVirtualDisplayMode *> *modes;
 
 - (nullable instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
+// Imported into Swift as `apply(_:)`. Also works on a live display to re-mode it in place.
 - (BOOL)applySettings:(CGVirtualDisplaySettings *)settings;
 @end
 

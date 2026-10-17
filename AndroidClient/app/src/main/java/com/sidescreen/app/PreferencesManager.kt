@@ -44,4 +44,33 @@ class PreferencesManager(
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
+
+    var orientationMode: OrientationMode
+        get() = OrientationMode.fromName(prefs.getString("orientation_mode", null))
+        set(value) = prefs.edit().putString("orientation_mode", value.name).apply()
+
+    var cutoutMode: CutoutMode
+        get() = CutoutMode.fromName(prefs.getString("cutout_mode", null))
+        set(value) = prefs.edit().putString("cutout_mode", value.name).apply()
+}
+
+enum class OrientationMode {
+    AUTO,
+    PORTRAIT,
+    LANDSCAPE,
+    ;
+
+    companion object {
+        fun fromName(name: String?): OrientationMode = entries.firstOrNull { it.name == name } ?: AUTO
+    }
+}
+
+enum class CutoutMode {
+    FILL,
+    AVOID,
+    ;
+
+    companion object {
+        fun fromName(name: String?): CutoutMode = entries.firstOrNull { it.name == name } ?: FILL
+    }
 }

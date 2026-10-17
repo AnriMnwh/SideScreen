@@ -97,9 +97,10 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
 EOF
 
 # Ad-hoc code sign to prevent Gatekeeper "damaged" error
-echo "Code signing (ad-hoc)..."
-codesign --force --deep --sign - --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR"
-echo "  ✓ App signed"
+echo "Code signing..."
+SIGN_ID=$(security find-identity -p codesigning | grep -o 'SideScreen Dev' | head -1 || echo "-")
+codesign --force --deep --sign "$SIGN_ID" --entitlements "$ROOT_DIR/MacHost/SideScreen.entitlements" "$APP_DIR"
+echo "  ✓ App signed with $SIGN_ID"
 
 echo ""
 echo "Build successful!"
